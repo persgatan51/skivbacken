@@ -79,7 +79,7 @@
          background:radial-gradient(120% 80% at 50% 0%,#1d2129 0%,#0f1115 70%)}
   .stage{position:absolute;inset:0;perspective:1100px;perspective-origin:50% 0%}
   .rec{position:absolute;left:50%;bottom:calc(var(--fh) * .38);width:var(--s);height:var(--s);margin-left:calc(var(--s) / -2);
-       transform-origin:50% 100%;will-change:transform;border-radius:3px;background:#22262e;
+       transform-origin:50% 100%;border-radius:3px;background:#22262e;
        box-shadow:0 -1px 0 rgba(255,255,255,.08) inset,0 14px 34px rgba(0,0,0,.65)}
   .rec img{width:100%;height:100%;object-fit:cover;display:block;border-radius:3px;pointer-events:none;-webkit-user-drag:none}
   .rec.loading img{opacity:0}
@@ -268,7 +268,8 @@ const norm = s => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ
 const sortKey = s => String(s || '').replace(/^(the|a)\s+/i, '');
 
 /* ---------------- Hyllan ---------------- */
-const cmpSv = (a, b) => String(a || '').localeCompare(String(b || ''), 'sv', { sensitivity: 'base' });
+const svColl = new Intl.Collator('sv', { sensitivity: 'base' });
+const cmpSv = (a, b) => svColl.compare(String(a || ''), String(b || ''));
 
 /* Efternamn: Discogs säger om artisten är en person (inga medlemmar) eller en grupp. */
 let artistInfo = LS.get('sh.artists', {});   // { "Bob Dylan": { person: true } }
@@ -284,8 +285,12 @@ function sortName(r) {
   return how === 'last' ? surname(r.artist) : sortKey(r.artist);
 }
 // Bokstavsordning på efternamn för personer (artist utan "The" för band), sedan årtal, sedan titel.
-const sortRecs = list => list.sort((a, b) =>
-  cmpSv(sortName(a), sortName(b)) || (a.year || 9999) - (b.year || 9999) || cmpSv(a.title, b.title));
+// Sorteringsnamnet räknas ut en gång per skiva, inte vid varje jämförelse.
+const sortRecs = list => {
+  const key = new Map(list.map(r => [r, sortName(r)]));
+  return list.sort((a, b) =>
+    cmpSv(key.get(a), key.get(b)) || (a.year || 9999) - (b.year || 9999) || cmpSv(a.title, b.title));
+};
 const letterOf = r => { const c = sortName(r).trim().charAt(0).toUpperCase(); return /\p{L}/u.test(c) ? c : '#'; };
 
 /* ---------------- Bakgrundsjobb mot Discogs: artister (efternamn) och priser ---------------- */
@@ -307,6 +312,7 @@ async function kickBg() {
   bgRunning = true;
   try {
     for (;;) {
+      await sleepMs(0);   // släpp alltid tråden mellan varven, så att appen aldrig kan låsa sig här
       let r = recs.find(needArtist);
       if (r) { await bgSafe(() => resolveArtistOne(r), r, 'artErr'); continue; }
       r = recs.find(x => x.status === 'have' && needPrice(x)) || recs.find(needPrice);
@@ -355,30 +361,34 @@ async function releaseIdOf(r, bg) {
   r.rid = j.main_release;
   return r.rid;
 }
-const priceInFlight = new Set();
-async function fetchPrice(r, bg) {
-  if (priceInFlight.has(r.id)) return;
-  priceInFlight.add(r.id);
+// Pågående prishämtningar per skiva. Den som frågar efter samma skiva får vänta på samma anrop
+// (annars kunde bakgrundsjobbet snurra utan paus och låsa appen).
+const priceInFlight = new Map();
+function fetchPrice(r, bg) {
+  if (priceInFlight.has(r.id)) return priceInFlight.get(r.id);
+  const p = fetchPriceNow(r, bg).finally(() => priceInFlight.delete(r.id));
+  priceInFlight.set(r.id, p);
+  return p;
+}
+async function fetchPriceNow(r, bg) {
+  const rid = await releaseIdOf(r, bg);
+  let sug = null;
   try {
-    const rid = await releaseIdOf(r, bg);
-    let sug = null;
-    try {
-      const s = await dg(`/marketplace/price_suggestions/${rid}`, {}, { bg });
-      if (s && Object.keys(s).length) sug = Object.fromEntries(Object.entries(s).map(([k, v]) => [k, { v: v.value, c: v.currency }]));
-      if (cfg.needSeller && sug) { cfg.needSeller = false; saveCfg(); }
-    } catch (e) {
-      if (e.status === 429) throw e;
-      // Prisförslag kräver att säljarinställningarna är ifyllda på Discogs.
-      if (e.status === 403 || e.status === 401 || /seller/i.test(e.detail)) { cfg.needSeller = true; saveCfg(); }
-    }
-    const st = await dg(`/marketplace/stats/${rid}`, { curr_abbr: 'SEK' }, { bg });
-    r.price = { at: Date.now(), rid, sug,
-      low: st.lowest_price ? { v: st.lowest_price.value, c: st.lowest_price.currency } : null,
-      n: st.num_for_sale || 0 };
-    delete r.priceErr;
-    saveRecs();
-    scheduleRender();
-  } finally { priceInFlight.delete(r.id); }
+    const s = await dg(`/marketplace/price_suggestions/${rid}`, {}, { bg });
+    if (s && Object.keys(s).length) sug = Object.fromEntries(Object.entries(s).map(([k, v]) => [k, { v: v.value, c: v.currency }]));
+    if (cfg.needSeller && sug) { cfg.needSeller = false; saveCfg(); }
+  } catch (e) {
+    if (e.status === 429) throw e;
+    // Prisförslag kräver att säljarinställningarna är ifyllda på Discogs.
+    if (e.status === 403 || e.status === 401 || /seller/i.test(e.detail)) { cfg.needSeller = true; saveCfg(); }
+  }
+  const st = await dg(`/marketplace/stats/${rid}`, { curr_abbr: 'SEK' }, { bg });
+  r.price = { at: Date.now(), rid, sug,
+    low: st.lowest_price ? { v: st.lowest_price.value, c: st.lowest_price.currency } : null,
+    n: st.num_for_sale || 0 };
+  delete r.priceErr;
+  saveRecs();
+  scheduleRender();
 }
 function worthLine() {
   const have = recs.filter(r => r.status === 'have');
@@ -398,7 +408,9 @@ function drawValue(r) {
   if (!r.dId) { box.innerHTML = ''; return; }
   if (!r.price) {
     box.innerHTML = '<div class="m"><span class="spin"></span>Hämtar pris från Discogs…</div>';
-    fetchPrice(r, false).catch(e => { if (cur === r) box.innerHTML = `<div class="m">${esc(e.message)}</div>`; });
+    fetchPrice(r, false)
+      .then(() => { if (cur === r && r.price) drawValue(r); })
+      .catch(e => { if (cur === r) box.innerHTML = `<div class="m">${esc(e.message)}</div>`; });
     return;
   }
   const v = valueOf(r), p = r.price;
@@ -444,6 +456,7 @@ async function showVersions(r, masterId) {
 }
 view.mode = LS.get('sh.mode', 'crate');
 
+let gridSig = '';
 function render() {
   const have = recs.filter(r => r.status === 'have').length;
   const want = recs.length - have;
@@ -462,11 +475,15 @@ function render() {
     ? `Backen är tom.<br>Tryck på <b>+</b> för att fota en skiva eller söka fram en.${!cfg.discogs ? '<br><br>Börja med att lägga in nycklarna under ⚙︎.' : ''}`
     : !list.length ? (q ? 'Inga träffar.' : view.tab === 'want' ? 'Önskelistan är tom.' : 'Inga skivor här än.') : '';
 
-  if (view.mode === 'crate') { crateSet(list, emptyMsg); return; }
+  if (view.mode === 'crate') { gridSig = ''; crateSet(list, emptyMsg); return; }
+  // Rutnätet byggs bara om när något som syns har ändrats (inte när ett pris kommer in i bakgrunden).
+  const sig = view.tab + '\n' + emptyMsg + '\n' + list.map(r => [r.id, r.cover, r.title, r.artist, r.year].join('|')).join('\n');
+  if (sig === gridSig) return;
+  gridSig = sig;
   if (emptyMsg) { $('#list').innerHTML = `<div class="msg">${emptyMsg}</div>`; return; }
   $('#list').innerHTML = '<div class="grid">' + list.map(r => `
     <button class="item" data-id="${r.id}">
-      ${r.cover ? `<img class="cover" loading="lazy" src="${esc(r.cover)}" alt="">` : '<div class="ph">♪</div>'}
+      ${r.cover ? `<img class="cover" loading="lazy" decoding="async" src="${esc(r.cover)}" alt="">` : '<div class="ph">♪</div>'}
       <div class="t">${esc(r.title)}</div>
       <div class="m">${esc(r.artist)}${r.year ? ' · ' + r.year : ''}</div>
     </button>`).join('') + '</div>';
@@ -482,7 +499,7 @@ $('#btnSearch').onclick = () => {
 $('#btnView').onclick = () => { view.mode = view.mode === 'crate' ? 'grid' : 'crate'; LS.set('sh.mode', view.mode); render(); crateLayout(); };
 
 /* ---------------- Skivbacken ---------------- */
-const crate = { pos: LS.get('sh.pos', 0), target: null, list: [], els: new Map(), S: 300, shown: -1, raf: 0, drag: null };
+const crate = { pos: LS.get('sh.pos', 0), target: null, list: [], idx: new Map(), els: new Map(), S: 300, shown: -1, raf: 0, drag: null };
 const clampPos = p => Math.max(0, Math.min(crate.list.length - 1, p));
 
 function crateLayout() {
@@ -512,6 +529,7 @@ function crateSet(list, emptyMsg) {
   if (crate.tab !== view.tab) { crate.els.forEach(el => el.remove()); crate.els.clear(); crate.tab = view.tab; }
   crate.sig = sig;
   crate.list = list;
+  crate.idx = new Map(list.map((r, i) => [r.id, i]));
   $('#crateEmpty').innerHTML = emptyMsg || '';
   if (!same) {
     const ids = new Set(list.map(r => r.id));
@@ -553,15 +571,14 @@ function crateDraw(force) {
   const { list, S } = crate, n = list.length, pos = crate.pos;
   if (!n) { crate.els.forEach(el => el.remove()); crate.els.clear(); updateNow(); return; }
   const f = Math.floor(pos);
-  // Skivor långt bort göms men behålls; bara de utanför ±40 tas bort.
+  // Skivor strax utanför bilden göms (display:none, så att de inte tar grafikminne) men behålls;
+  // de utanför -20/+30 tas bort helt.
   const lo = Math.max(0, f - 4), hi = Math.min(n - 1, f + 14);
-  const keepLo = f - 40, keepHi = f + 60;
-  const visible = new Set();
-  for (let i = lo; i <= hi; i++) visible.add(list[i].id);
-  list.forEach((r, i) => {
-    const el = crate.els.get(r.id); if (!el) return;
-    if (i < keepLo || i > keepHi) { el.remove(); crate.els.delete(r.id); }
-    else if (!visible.has(r.id)) el.style.visibility = 'hidden';
+  const keepLo = f - 20, keepHi = f + 30;
+  crate.els.forEach((el, id) => {
+    const i = crate.idx.get(id);
+    if (i == null || i < keepLo || i > keepHi) { el.remove(); crate.els.delete(id); }
+    else if (i < lo || i > hi) { el.hidden = true; el.style.willChange = ''; }
   });
   for (let i = Math.min(n - 1, f + 15); i <= Math.min(n - 1, f + 30); i++) preload(list[i].cover);
   for (let i = lo; i <= hi; i++) {
@@ -574,6 +591,8 @@ function crateDraw(force) {
     } else {                            // ligger framfälld mot framkanten
       const t = Math.min(1, -d - 1); rx = -80 - t * 4; y = 0.02 * S; z = 0.07 * S + t * 0.02 * S; sh = 0.35 + t * 0.2; op = 1 - t;
     }
+    el.hidden = false;
+    el.style.willChange = 'transform';   // bara de ~19 synliga får ett eget grafiklager
     el.style.visibility = op > 0.001 ? 'visible' : 'hidden';
     el.style.transform = `translate3d(0,${y.toFixed(1)}px,${z.toFixed(1)}px) rotateX(${rx.toFixed(2)}deg)`;
     el.style.zIndex = String(Math.round(2000 - d * 10));
@@ -1155,8 +1174,12 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-14';
+const WEB_VERSION = '2026-11-15';
 const CHANGELOG = [
+  { d: '2026-11-15', t: 'Stabilare och lättare', i: [
+    'Rättat: appen kunde låsa sig om ett pris hämtades samtidigt i bakgrunden, t.ex. vid "Uppdatera pris".',
+    'Skivbacken använder mindre minne: bara omslagen närmast dig hålls redo.',
+    'Rutnätet ritas inte om i onödan när priser hämtas, så det hackar inte längre medan du skrollar.' ] },
   { d: '2026-11-14', t: 'Skivornas värde', i: [
     'Värde per skiva enligt Discogs prisförslag, för det skick du väljer (standard VG+).',
     'Lägsta pris just nu och hur många som är till salu.',
