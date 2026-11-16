@@ -13,7 +13,10 @@ import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.util.Base64
 import androidx.core.content.FileProvider
 import com.google.android.gms.tasks.Tasks
@@ -27,7 +30,9 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.Executors
 
 /**
@@ -37,7 +42,10 @@ import java.util.concurrent.Executors
  *  - App.saveBackup()/loadBackup(): backupfil via Androids filväljare (t.ex. Google Drive),
  *  - App.scan(): läser streckkod och text i fotot med ML Kit (gratis, i telefonen),
  *  - att Spotify-länkar öppnas i Spotify-appen,
- *  - att Spotify-inloggningen sker inne i appen så att svaret kommer tillbaka hit.
+ *  - att Spotify-inloggningen sker inne i appen så att svaret kommer tillbaka hit,
+ *  - App.takePending(): foto/backup som blev kvar om Android stängde appen medan kameran eller filväljaren var öppen.
+ *
+ * Bryggan App.* svarar bara när sidan som visas är webbappen (inte t.ex. Spotifys inloggningssidor).
  */
 class MainActivity : Activity() {
 
@@ -59,6 +67,8 @@ class MainActivity : Activity() {
     private var pendingSaveJson: String? = null
     private var pendingSaveId: String? = null
     private var pendingOpenId: String? = null
+    // Värd för sidan som visas just nu. Bryggan används bara när det är webbappen.
+    @Volatile private var pageHost: String? = null
     private val barcodeScanner by lazy {
         BarcodeScanning.getClient(
             BarcodeScannerOptions.Builder().setBarcodeFormats(
@@ -82,6 +92,12 @@ class MainActivity : Activity() {
                 if (uri.host in INSIDE) return false
                 openExternal(uri)
                 return true
+            }
+            override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
+                pageHost = url?.let { Uri.parse(it).host }
+            }
+            override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                pageHost = url?.let { Uri.parse(it).host }
             }
         }
 
@@ -116,6 +132,8 @@ class MainActivity : Activity() {
             }
         }
 
+        // Fotot som kameran skulle spara, om appen stängts av Android medan kameran var öppen.
+        savedInstanceState?.getString("photoUri")?.let { photoUri = Uri.parse(it) }
         web.addJavascriptInterface(Bridge(), "App")
         // ?v= gör att sidan alltid hämtas färsk vid start (GitHub Pages cachar annars i upp till 10 min).
         if (savedInstanceState != null) web.restoreState(savedInstanceState)
@@ -127,7 +145,14 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_SAVE || requestCode == REQ_OPEN) { onBackupResult(requestCode, resultCode, data); return }
         if (requestCode != REQ_FILE) return
-        val cb = fileCallback ?: return
+        val cb = fileCallback
+        if (cb == null) {
+            // Appen har startats om sedan kameran/bildväljaren öppnades: spara resultatet till webbappen.
+            val uri = if (resultCode == RESULT_OK) photoUri ?: data?.data else null
+            photoUri = null
+            if (uri != null) setPending("photo", uri.toString())
+            return
+        }
         fileCallback = null
         val result: Array<Uri>? = when {
             resultCode != RESULT_OK -> null
@@ -140,6 +165,39 @@ class MainActivity : Activity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         web.saveState(outState)
+        photoUri?.let { outState.putString("photoUri", it.toString()) }
+    }
+
+    /* ---------- Resultat som kommer efter att Android stängt och startat om appen ---------- */
+    private fun setPending(type: String, uri: String) {
+        prefs.edit().putString("pendingType", type).putString("pendingUri", uri).apply()
+        // Om webbappen redan är laddad: be den hämta resultatet direkt (annars gör den det vid start).
+        web.evaluateJavascript("window.__checkPending && window.__checkPending()", null)
+    }
+
+    /** Läser in fotot nedskalat (max 2000 px) och vänt rätt enligt EXIF, som JPEG i base64. */
+    private fun photoB64(uri: Uri): String {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 2000) sample *= 2
+        val bmp = contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+        } ?: throw Exception("Kunde inte läsa fotot")
+        val rot = try {
+            contentResolver.openInputStream(uri)?.use {
+                when (ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                    ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                    ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                    else -> 0f
+                }
+            } ?: 0f
+        } catch (_: Exception) { 0f }
+        val out = if (rot != 0f) Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(rot) }, true) else bmp
+        val bos = ByteArrayOutputStream()
+        out.compress(Bitmap.CompressFormat.JPEG, 90, bos)
+        return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
     }
 
     @Deprecated("Deprecated in Java")
@@ -180,9 +238,21 @@ class MainActivity : Activity() {
 
     /* ---------- Backup: en JSON-fil på valfri plats, t.ex. Google Drive ---------- */
     private fun writeTo(uri: Uri, json: String) {
-        val os = try { contentResolver.openOutputStream(uri, "wt") } catch (_: Exception) { null }
-            ?: contentResolver.openOutputStream(uri, "w") ?: throw Exception("Kan inte skriva filen")
-        os.use { it.write(json.toByteArray()) }
+        val bytes = json.toByteArray()
+        val wt = try { contentResolver.openOutputStream(uri, "wt") } catch (_: Exception) { null }
+        if (wt != null) { wt.use { it.write(bytes) }; return }
+        // "wt" (skriv och töm filen) stöds inte överallt. Med "w" töms inte alltid filen, så att gammal text
+        // kan ligga kvar i slutet och göra backupen trasig. Töm den själva och kontrollera resultatet.
+        val ok = try {
+            contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
+                // Strömmen stängs inte här; filen stängs när pfd stängs.
+                val fos = FileOutputStream(pfd.fileDescriptor)
+                fos.channel.truncate(0); fos.channel.position(0); fos.write(bytes); fos.flush()
+            } != null
+        } catch (_: Exception) { false }
+        if (!ok) (contentResolver.openOutputStream(uri, "w") ?: throw Exception("Kan inte skriva filen")).use { it.write(bytes) }
+        val back = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        if (back != null && !back.contentEquals(bytes)) throw Exception("Filen blev inte rätt sparad. Välj en ny plats för backupen.")
     }
     private fun nameOf(uri: Uri): String = try {
         contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
@@ -193,6 +263,8 @@ class MainActivity : Activity() {
         contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
         prefs.edit().putString("backupUri", uri.toString()).apply(); true
     } catch (_: Exception) { false }
+    // Filnamnet sparas så att App.backupName() kan svara direkt utan att fråga Drive (som kan vara långsamt).
+    private fun rememberName(uri: Uri): String = nameOf(uri).also { prefs.edit().putString("backupName", it).apply() }
 
     private fun pickSave(json: String, id: String) {
         pendingSaveJson = json; pendingSaveId = id
@@ -210,19 +282,30 @@ class MainActivity : Activity() {
     private fun onBackupResult(requestCode: Int, resultCode: Int, data: Intent?) {
         val uri = data?.data
         if (requestCode == REQ_SAVE) {
-            val id = pendingSaveId ?: return; val json = pendingSaveJson ?: ""
+            val id = pendingSaveId
+            if (id == null) {
+                // Appen startades om medan filväljaren var öppen: kom ihåg filen och låt webbappen spara igen.
+                if (resultCode == RESULT_OK && uri != null && keep(uri)) setPending("save", uri.toString())
+                return
+            }
+            val json = pendingSaveJson ?: ""
             pendingSaveId = null; pendingSaveJson = null
             if (resultCode != RESULT_OK || uri == null) { reply(id, false, "cancel"); return }
             keep(uri)
             worker.execute {
-                try { writeTo(uri, json); reply(id, true, nameOf(uri)) }
+                try { writeTo(uri, json); reply(id, true, rememberName(uri)) }
                 catch (e: Exception) { reply(id, false, "Kunde inte spara: ${e.message}") }
             }
         } else {
-            val id = pendingOpenId ?: return
+            val id = pendingOpenId
+            if (id == null) {
+                if (resultCode == RESULT_OK && uri != null) { keep(uri); setPending("load", uri.toString()) }
+                return
+            }
             pendingOpenId = null
             if (resultCode != RESULT_OK || uri == null) { reply(id, false, "cancel"); return }
             keep(uri)   // fortsatta backuper sparas i samma fil
+            worker.execute { rememberName(uri) }
             worker.execute {
                 try {
                     val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
@@ -233,15 +316,19 @@ class MainActivity : Activity() {
     }
 
     inner class Bridge {
-        @JavascriptInterface fun version(): String = "3"
+        // Bara webbappen får använda bryggan, inte andra sidor som visas i appen (t.ex. Spotifys inloggning).
+        private fun trusted() = pageHost == HOST
+
+        @JavascriptInterface fun version(): String = if (trusted()) "4" else "0"
 
         /** mode: "auto" = bara om en fil redan är vald, "save" = samma fil som förut (annars välj), "pick" = välj ny plats. */
         @JavascriptInterface fun saveBackup(json: String, id: String, mode: String) {
+            if (!trusted()) return
             val saved = prefs.getString("backupUri", null)
             if (mode != "pick" && saved != null) {
                 worker.execute {
                     val uri = Uri.parse(saved)
-                    try { writeTo(uri, json); reply(id, true, nameOf(uri)) }
+                    try { writeTo(uri, json); reply(id, true, rememberName(uri)) }
                     catch (e: Exception) {
                         if (mode == "auto") reply(id, false, "nouri") else runOnUiThread { pickSave(json, id) }
                     }
@@ -249,12 +336,35 @@ class MainActivity : Activity() {
             } else if (mode == "auto") reply(id, false, "nouri")
             else runOnUiThread { pickSave(json, id) }
         }
-        @JavascriptInterface fun loadBackup(id: String) = runOnUiThread { pickOpen(id) }
+        @JavascriptInterface fun loadBackup(id: String) { if (trusted()) runOnUiThread { pickOpen(id) } }
         @JavascriptInterface fun backupName(): String =
-            prefs.getString("backupUri", null)?.let { nameOf(Uri.parse(it)) } ?: ""
+            if (!trusted() || prefs.getString("backupUri", null) == null) "" else prefs.getString("backupName", null) ?: "backupfilen"
+
+        /** Resultat som blev kvar efter att Android stängt appen. Svarar med JSON {type, data}. */
+        @JavascriptInterface fun takePending(id: String) {
+            if (!trusted()) return
+            val type = prefs.getString("pendingType", null)
+            val uriStr = prefs.getString("pendingUri", null)
+            prefs.edit().remove("pendingType").remove("pendingUri").apply()
+            if (type == null || uriStr == null) { reply(id, true, "{}"); return }
+            worker.execute {
+                val res = JSONObject().put("type", type)
+                try {
+                    val uri = Uri.parse(uriStr)
+                    when (type) {
+                        "photo" -> res.put("data", photoB64(uri))
+                        "load" -> res.put("data", contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: "")
+                        else -> res.put("data", "")
+                    }
+                } catch (e: Exception) {
+                    res.put("type", "error").put("data", "Kunde inte läsa ${if (type == "photo") "fotot" else "filen"}: ${e.message}")
+                }
+                reply(id, true, res.toString())
+            }
+        }
 
         /** Googles streckkodsskanner. Svarar med siffrorna, "cancel" eller ett fel. */
-        @JavascriptInterface fun scanBarcode(id: String) = runOnUiThread {
+        @JavascriptInterface fun scanBarcode(id: String) { if (trusted()) runOnUiThread {
             val options = GmsBarcodeScannerOptions.Builder()
                 .setBarcodeFormats(Barcode.FORMAT_EAN_13, Barcode.FORMAT_EAN_8, Barcode.FORMAT_UPC_A, Barcode.FORMAT_UPC_E)
                 .enableAutoZoom()
@@ -263,11 +373,20 @@ class MainActivity : Activity() {
                 .addOnSuccessListener { reply(id, true, it.rawValue ?: "") }
                 .addOnCanceledListener { reply(id, false, "cancel") }
                 .addOnFailureListener { e -> reply(id, false, "fail:" + (e.message ?: "")) }
+        } }
+        @JavascriptInterface fun scan(b64: String, id: String) {
+            if (!trusted()) return
+            worker.execute {
+                try { reply(id, true, this@MainActivity.scan(b64)) }
+                catch (e: Exception) { reply(id, false, "Kunde inte läsa av bilden: ${e.message ?: e.javaClass.simpleName}") }
+            }
         }
-        @JavascriptInterface fun scan(b64: String, id: String) = worker.execute {
-            try { reply(id, true, this@MainActivity.scan(b64)) }
-            catch (e: Exception) { reply(id, false, "Kunde inte läsa av bilden: ${e.message ?: e.javaClass.simpleName}") }
+        // Bara http(s)- och spotify-länkar öppnas utanför appen.
+        @JavascriptInterface fun openExternal(url: String) {
+            if (!trusted()) return
+            val uri = Uri.parse(url)
+            if (uri.scheme !in setOf("https", "http", "spotify")) return
+            runOnUiThread { this@MainActivity.openExternal(uri) }
         }
-        @JavascriptInterface fun openExternal(url: String) = runOnUiThread { this@MainActivity.openExternal(Uri.parse(url)) }
     }
 }

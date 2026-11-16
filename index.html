@@ -133,12 +133,37 @@
   .log .m{margin-bottom:4px}
   .log ul{margin:6px 0 0;padding-left:20px}
   .log li{margin:3px 0}
+  .loanTag{position:absolute;top:8px;left:8px;background:#2a2f3a;color:var(--fg);font-size:12px;font-weight:700;padding:3px 8px;border-radius:999px;z-index:1}
+  .dealTag{background:var(--sp);color:#04140a}
+  .inl{display:flex;gap:8px;align-items:center;margin-top:8px}
+  .inl input{flex:1;padding:8px 10px}
+  .inl button{flex:none}
+  .err{color:#ff8a80}
+  /* Statistik: enkla staplar i en färg, text i vanliga textfärger */
+  .st h3{margin:20px 0 8px;font-size:15px}
+  .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px}
+  .kpi b{display:block;font-size:19px}
+  .kpi span{font-size:12px;color:var(--mut)}
+  .bars{display:grid;grid-template-columns:minmax(64px,auto) 1fr auto;gap:6px 10px;align-items:center;font-size:13px}
+  .bars .lb{color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40vw}
+  .bars .tr0{height:10px;background:#20242c;border-radius:4px;overflow:hidden}
+  .bars .br{height:100%;background:var(--acc);border-radius:0 4px 4px 0;min-width:2px}
+  .bars .vl{text-align:right;font-variant-numeric:tabular-nums}
+  .rlist .ri{display:grid;grid-template-columns:40px 1fr auto;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid var(--line);cursor:pointer}
+  .rlist .ri img,.rlist .ri .ph{width:40px;height:40px;border-radius:4px;font-size:16px}
+  .rlist .ri .x{font-size:13px;text-align:right;font-variant-numeric:tabular-nums}
+  .spark{width:100%;height:64px;display:block;margin-top:6px}
+  .spark path.l{fill:none;stroke:var(--acc);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+  .spark path.a{fill:var(--acc);opacity:.12}
 </style>
 </head>
 <body>
 <header>
   <div class="row">
     <h1>Skivbacken</h1>
+    <button id="btnRandom" class="ico" aria-label="Slumpa en skiva">🎲</button>
+    <button id="btnStats" class="ico" aria-label="Statistik">📊</button>
     <button id="btnSearch" class="ico" aria-label="Sök">🔍</button>
     <button id="btnView" class="ico" aria-label="Byt vy">▦</button>
     <button id="btnSettings" class="ico" aria-label="Inställningar">⚙︎</button>
@@ -189,6 +214,8 @@
 </div>
 
 <div class="sheet" id="logSheet" style="z-index:25"><div class="panel"><div class="pad" id="logBody"></div></div></div>
+
+<div class="sheet" id="statsSheet"><div class="panel"><div class="pad st" id="statsBody"></div></div></div>
 
 <div class="sheet" id="detail"><div class="panel" id="detailBody"></div></div>
 
@@ -241,7 +268,8 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const LS = {
   get(k, d) { try { const v = JSON.parse(localStorage.getItem(k)); return v ?? d; } catch { return d; } },
-  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+  // Returnerar false om det inte gick att spara (t.ex. fullt minne), så att anroparen kan varna.
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { console.log('LS.set', k, e); return false; } }
 };
 const REDIRECT = location.origin + location.pathname;
 
@@ -251,7 +279,28 @@ let recs = LS.get('sh.recs', []);          // skivorna
 let view = { tab: 'have', q: '' };
 let addDefault = 'have';
 
-const saveRecs = () => { LS.set('sh.recs', recs); if (typeof autoBackup === 'function') autoBackup(); };
+let deleted = LS.get('sh.deleted', {});   // { id: tidpunkt } för borttagna skivor och köposter, så att en backup inte väcker dem igen
+
+/* Spara skivorna.
+   - Användarens ändringar sparas direkt och startar den automatiska backupen.
+   - Bakgrundsjobb (priser, låtlistor, Spotify-matchning) sparas samlat högst var 10:e sekund
+     och startar ingen backup, så att telefonen inte skriver hela samlingen var annan sekund. */
+let bgSaveT = 0, lastFullWarn = 0;
+function persistRecs() {
+  clearTimeout(bgSaveT); bgSaveT = 0;
+  if (LS.set('sh.recs', recs)) return true;
+  if (Date.now() - lastFullWarn > 60000) {
+    lastFullWarn = Date.now();
+    toast('Kunde inte spara i telefonen – minnet är fullt. Spara en backup nu under ⚙︎.', 7000);
+    if (typeof driveSave === 'function') driveSave('auto');
+  }
+  return false;
+}
+const saveRecs = (o = {}) => {
+  if (o.bg) { if (!bgSaveT) bgSaveT = setTimeout(persistRecs, 10000); return; }
+  persistRecs();
+  if (typeof autoBackup === 'function') autoBackup();
+};
 const saveCfg = () => LS.set('sh.cfg', cfg);
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
@@ -294,43 +343,86 @@ const sortRecs = list => {
 const letterOf = r => { const c = sortName(r).trim().charAt(0).toUpperCase(); return /\p{L}/u.test(c) ? c : '#'; };
 
 /* ---------------- Bakgrundsjobb mot Discogs: artister (efternamn) och priser ---------------- */
-let bgRunning = false, rerenderT;
+let bgRunning = false, bgRetryT, rerenderT, rerenderFull = false;
 const DAY = 864e5, PRICE_DAYS = 7;
 const sleepMs = ms => new Promise(res => setTimeout(res, ms));
-function scheduleRender() {
+// full = false: bara värderaden och detaljvyn uppdateras (t.ex. när ett pris kommer in), inte hela listan.
+function scheduleRender(full = true) {
+  rerenderFull = rerenderFull || full;
   clearTimeout(rerenderT);
   rerenderT = setTimeout(() => {
-    if (!crate.drag && crate.target == null) render();
+    if (rerenderFull) {
+      if (crate.drag || crate.target != null) { scheduleRender(true); return; }   // vänta tills bläddringen är klar
+      rerenderFull = false;
+      render();
+    } else updateWorth();
     if (cur && $('#detail').classList.contains('open')) drawValue(cur);
   }, 1200);
 }
 const needArtist = r => r.artist && r.dId && !artistInfo[r.artist] && !(r.artErr > Date.now() - DAY);
-const needPrice = r => r.dId && (!r.price || Date.now() - r.price.at > PRICE_DAYS * DAY) && !(r.priceErr > Date.now() - DAY);
+// Bevakade skivor på önskelistan kollas varje dygn, övriga varje vecka.
+const priceDays = r => r.status === 'want' && r.watch ? 1 : PRICE_DAYS;
+const needPrice = r => r.dId && (!r.price || Date.now() - r.price.at > priceDays(r) * DAY) && !(r.priceErr > Date.now() - DAY);
+const needInfo = r => r.dId && !r.genre && !(r.infoErr > Date.now() - DAY);
 function resolveArtists() { kickBg(); }
 async function kickBg() {
   if (bgRunning || !cfg.discogs) return;
   bgRunning = true;
+  clearTimeout(bgRetryT);
+  let stopped = false;
   try {
     for (;;) {
       await sleepMs(0);   // släpp alltid tråden mellan varven, så att appen aldrig kan låsa sig här
       let r = recs.find(needArtist);
-      if (r) { await bgSafe(() => resolveArtistOne(r), r, 'artErr'); continue; }
+      if (r) { if (!(await bgSafe(() => resolveArtistOne(r), r, 'artErr'))) { stopped = true; break; } continue; }
       r = recs.find(x => x.status === 'have' && needPrice(x)) || recs.find(needPrice);
-      if (r) { await bgSafe(() => fetchPrice(r, true), r, 'priceErr'); continue; }
+      if (r) { if (!(await bgSafe(() => fetchPrice(r, true), r, 'priceErr'))) { stopped = true; break; } continue; }
+      r = recs.find(needInfo);
+      if (r) { if (!(await bgSafe(() => fetchInfo(r), r, 'infoErr'))) { stopped = true; break; } continue; }
       break;
     }
-  } finally { bgRunning = false; scheduleRender(); }
-}
-async function bgSafe(fn, r, errKey) {
-  try { await fn(); }
-  catch (e) {
-    if (e.status === 429) await sleepMs(60000);
-    else { r[errKey] = Date.now(); LS.set('sh.recs', recs); }
+  } finally {
+    bgRunning = false;
+    if (!stopped) recordWorth();
+    scheduleRender();
+    // Nätverksfel eller fel hos Discogs: försök igen om 5 minuter (eller när nätet kommer tillbaka).
+    if (stopped) bgRetryT = setTimeout(kickBg, 5 * 60000);
+    if (!spMatching) matchAll();
   }
+}
+// Returnerar false om bakgrundsjobbet ska avbrytas (inget nät, Discogs nere eller fel token).
+// Då markeras inte skivan, så att den inte blir hoppad över i ett dygn.
+async function bgSafe(fn, r, errKey) {
+  try { await fn(); return true; }
+  catch (e) {
+    if (e.status === 429) { await sleepMs(60000); return true; }
+    if (!e.status || e.status >= 500 || e.status === 401) return false;
+    r[errKey] = Date.now(); saveRecs({ bg: true });
+    return true;
+  }
+}
+addEventListener('online', () => kickBg());
+// Sparar genrer, stilar och låtlista från Discogs (används i statistiken).
+function applyInfo(r, j) {
+  r.genre = (j.genres || []).slice(0, 3);
+  r.style = (j.styles || []).slice(0, 4);
+  if (!r.year && j.year) r.year = j.year;
+  if (!r.tracks && j.tracklist) r.tracks = j.tracklist.map(t => ({ p: t.position || '', t: t.title || '', d: t.duration || '', h: t.type_ === 'heading' }));
+  if (r.dType === 'master' && j.main_release && !r.rid) r.rid = j.main_release;
+  // Skivor som lagts till från diskografin har bara en liten bild; byt till den stora.
+  if (r.coverSmall && j.images?.[0]?.uri) { r.cover = j.images[0].uri; delete r.coverSmall; return true; }
+  return false;
+}
+async function fetchInfo(r) {
+  const j = await dg(r.dType === 'master' ? `/masters/${r.dId}` : `/releases/${r.dId}`, {}, { bg: true });
+  const newCover = applyInfo(r, j);
+  saveRecs({ bg: true });
+  if (newCover) scheduleRender(true);
 }
 async function resolveArtistOne(r) {
   const j = await dg(r.dType === 'master' ? `/masters/${r.dId}` : `/releases/${r.dId}`, {}, { bg: true });
-  if (r.dType === 'master' && j.main_release && !r.rid) r.rid = j.main_release;
+  applyInfo(r, j);
+  saveRecs({ bg: true });
   const a = (j.artists || [])[0];
   let person = false;
   if (a?.id && !/^various$/i.test(a.name)) {
@@ -339,7 +431,7 @@ async function resolveArtistOne(r) {
     person = !(aj.members && aj.members.length) && (!!aj.realname || (words >= 2 && words <= 3))
       && !/\b(and|&|band|orchestra|orkester|trio|quartet|kvartett)\b/i.test(r.artist);
   }
-  artistInfo[r.artist] = { person };
+  artistInfo[r.artist] = { person, ...(a?.id ? { id: a.id } : {}) };
   LS.set('sh.artists', artistInfo);
   scheduleRender();
 }
@@ -352,15 +444,19 @@ const condOf = r => r.cond || cfg.cond || 'Very Good Plus (VG+)';
 const valueOf = r => r.price?.sug?.[condOf(r)] || null;
 function money(v, c) {
   try { return new Intl.NumberFormat('sv-SE', { style: 'currency', currency: c || 'SEK', maximumFractionDigits: 0 }).format(v); }
-  catch { return Math.round(v) + ' ' + (c || ''); }
+  catch { return Math.round(v) + ' ' + esc(c || ''); }   // okänd valutakod: escapa, resultatet hamnar i HTML
 }
 async function releaseIdOf(r, bg) {
   if (r.rid) return r.rid;
   if (r.dType !== 'master') return r.dId;
   const j = await dg(`/masters/${r.dId}`, {}, { bg });
+  if (!j.main_release) { const e = new Error('Discogs har ingen huvudutgåva för skivan. Välj exakt utgåva.'); e.status = 404; throw e; }
   r.rid = j.main_release;
   return r.rid;
 }
+// Fynd: lägsta pris just nu är under gränsen man satt för en skiva på önskelistan.
+const isDeal = r => r.status === 'want' && r.watch > 0 && r.price?.low && (r.price.low.c || 'SEK') === 'SEK' && r.price.low.v <= r.watch;
+const sellUrl = r => `https://www.discogs.com/sell/release/${r.price?.rid || r.rid || r.dId}?currency=SEK`;
 // Pågående prishämtningar per skiva. Den som frågar efter samma skiva får vänta på samma anrop
 // (annars kunde bakgrundsjobbet snurra utan paus och låsa appen).
 const priceInFlight = new Map();
@@ -387,12 +483,45 @@ async function fetchPriceNow(r, bg) {
     low: st.lowest_price ? { v: st.lowest_price.value, c: st.lowest_price.currency } : null,
     n: st.num_for_sale || 0 };
   delete r.priceErr;
-  saveRecs();
-  scheduleRender();
+  // Värdeutveckling: en punkt per hämtning (högst en per dygn), max 52 punkter.
+  const v = valueOf(r);
+  if (v) {
+    const h = r.priceHist || (r.priceHist = []);
+    const pt = { t: r.price.at, v: v.v, c: v.c, k: condShort(condOf(r)) };
+    if (h.length && r.price.at - h[h.length - 1].t < DAY) h[h.length - 1] = pt; else h.push(pt);
+    if (h.length > 52) h.splice(0, h.length - 52);
+  }
+  // Prisbevakning: säg till en gång per nytt lägsta pris.
+  if (isDeal(r) && r.dealSeen !== r.price.low.v) {
+    r.dealSeen = r.price.low.v;
+    crateForget(r.id); gridSig = ''; scheduleRender(true);
+    toast(`Fynd: ${r.title} finns för ${money(r.price.low.v, 'SEK')} på Discogs`, 6000);
+  }
+  saveRecs({ bg: true });
+  scheduleRender(false);
 }
-function worthLine() {
+// Samlingens totala värde sparas en gång per dygn, för grafen i statistiken.
+function recordWorth() {
   const have = recs.filter(r => r.status === 'have');
-  if (!have.length || view.tab === 'want') return '';
+  const sums = {}; let n = 0;
+  for (const r of have) { const v = valueOf(r); if (v) { sums[v.c] = (sums[v.c] || 0) + v.v; n++; } }
+  const main = Object.entries(sums).sort((a, b) => b[1] - a[1])[0];
+  if (!main || n < Math.min(5, have.length)) return;
+  const h = LS.get('sh.worthHist', []);
+  const pt = { t: Date.now(), v: Math.round(main[1]), c: main[0], n };
+  if (h.length && today() === new Date(h[h.length - 1].t).toLocaleDateString('sv-SE')) h[h.length - 1] = pt; else h.push(pt);
+  if (h.length > 400) h.splice(0, h.length - 400);
+  LS.set('sh.worthHist', h);
+}
+function updateWorth() { const w = worthLine(); $('#worth').innerHTML = w; $('#worth').hidden = !w; }
+function worthLine() {
+  if (view.tab === 'want') {
+    const deals = recs.filter(isDeal).length, watched = recs.filter(r => r.status === 'want' && r.watch).length;
+    if (deals) return `<a href="#" data-act="deals"><b>${deals} fynd</b> under din prisgräns just nu</a>`;
+    return watched ? `${watched} skivor bevakas · inga under din gräns just nu` : '';
+  }
+  const have = recs.filter(r => r.status === 'have');
+  if (!have.length) return '';
   const sums = {}; let n = 0;
   for (const r of have) { const v = valueOf(r); if (v) { sums[v.c] = (sums[v.c] || 0) + v.v; n++; } }
   const cond = condShort(cfg.cond || 'Very Good Plus (VG+)');
@@ -406,16 +535,30 @@ function worthLine() {
 function drawValue(r) {
   const box = $('#dVal'); if (!box) return;
   if (!r.dId) { box.innerHTML = ''; return; }
+  const masterId = r.masterId || (r.dType === 'master' ? r.dId : null);
   if (!r.price) {
+    // Misslyckades hämtningen nyligen: visa felet och en knapp i stället för att fråga Discogs igen och igen.
+    if (r.priceErr > Date.now() - DAY && !priceInFlight.has(r.id)) {
+      box.innerHTML = `<div class="m">${esc(r.priceErrMsg || 'Kunde inte hämta pris från Discogs.')}</div>
+        <div class="row" style="gap:8px;margin-top:8px;flex-wrap:wrap">
+          ${masterId ? '<button id="dVers">Välj exakt utgåva</button>' : ''}<button id="dRetry">Försök igen</button></div><div id="dVersList"></div>`;
+      $('#dRetry').onclick = () => { delete r.priceErr; drawValue(r); };
+      if ($('#dVers')) $('#dVers').onclick = () => showVersions(r, masterId);
+      return;
+    }
     box.innerHTML = '<div class="m"><span class="spin"></span>Hämtar pris från Discogs…</div>';
-    fetchPrice(r, false)
-      .then(() => { if (cur === r && r.price) drawValue(r); })
-      .catch(e => { if (cur === r) box.innerHTML = `<div class="m">${esc(e.message)}</div>`; });
+    priceNow(r).finally(() => { if (cur === r) drawValue(r); });
     return;
   }
   const v = valueOf(r), p = r.price;
-  const masterId = r.masterId || (r.dType === 'master' ? r.dId : null);
+  const deal = isDeal(r);
   box.innerHTML = `
+    ${r.status === 'want' ? `
+      <div class="m">Prisbevakning</div>
+      <div class="inl"><input id="dWatch" type="number" inputmode="numeric" min="0" placeholder="Säg till under … kr" value="${r.watch ? esc(r.watch) : ''}"><button id="dWatchSave">${r.watch ? 'Ändra' : 'Bevaka'}</button></div>
+      ${deal ? `<p class="note" style="color:var(--sp)"><b>Fynd!</b> Lägst just nu ${money(p.low.v, 'SEK')}, under din gräns.</p>` : r.watch ? '<p class="note">Kollas varje dygn. Du får en notis i appen när någon säljer den under gränsen.</p>' : ''}
+      ${p.low ? '<div class="actions" style="margin-top:8px"><button id="dSell">Se vilka som säljer på Discogs</button></div>' : ''}
+      <div style="height:12px"></div>` : ''}
     <div class="m">Värde enligt Discogs prisförslag</div>
     <div class="row" style="justify-content:space-between;margin-top:2px">
       <div class="valbig">${v ? 'ca ' + money(v.v, v.c) : '–'}</div>
@@ -424,14 +567,59 @@ function drawValue(r) {
     ${!p.sug ? `<p class="note">Inget prisförslag. ${cfg.needSeller ? 'Fyll i <a href="https://www.discogs.com/settings/seller">säljarinställningar på Discogs</a> (välj SEK) så visas det.' : 'Discogs har för lite försäljningar av den här utgåvan.'}</p>` : ''}
     <div class="m" style="margin-top:6px">${p.low ? `Lägst just nu ${money(p.low.v, p.low.c)} · ${p.n} till salu` : 'Ingen till salu just nu'}</div>
     <div class="m">Utgåva: ${esc(r.relLabel || (r.rid && r.dType === 'master' ? 'huvudutgåvan' : 'den du valde'))} · uppdaterat ${esc(new Date(p.at).toLocaleDateString('sv-SE'))}</div>
+    ${histSvg(r)}
     <div class="row" style="gap:8px;margin-top:8px;flex-wrap:wrap">
       ${masterId ? '<button id="dVers">Välj exakt utgåva</button>' : ''}
-      <button id="dRefresh">Uppdatera pris</button>
+      <button id="dRefresh">${priceInFlight.has(r.id) ? '<span class="spin"></span>Hämtar…' : 'Uppdatera pris'}</button>
     </div>
+    <div class="m err" id="dValErr"></div>
     <div id="dVersList"></div>`;
-  $('#dCond').onchange = e => { r.cond = e.target.value; saveRecs(); drawValue(r); render(); };
-  $('#dRefresh').onclick = () => { r.price = null; drawValue(r); };
+  $('#dCond').onchange = e => { r.cond = e.target.value; saveRecs(); drawValue(r); updateWorth(); };
+  // Det gamla priset ligger kvar tills det nya har kommit; misslyckas det visas felet under knappen.
+  $('#dRefresh').onclick = () => {
+    if (priceInFlight.has(r.id)) return;
+    priceNow(r).then(ok => { if (cur !== r) return; drawValue(r); if (!ok && $('#dValErr')) $('#dValErr').textContent = r.priceErrMsg || 'Kunde inte uppdatera priset.'; });
+    drawValue(r);
+  };
   if ($('#dVers')) $('#dVers').onclick = () => showVersions(r, masterId);
+  if ($('#dWatchSave')) $('#dWatchSave').onclick = () => {
+    const n = Math.round(+$('#dWatch').value);
+    if (n > 0) { r.watch = n; delete r.dealSeen; toast(`Bevakas: säger till under ${money(n, 'SEK')}`); }
+    else { delete r.watch; toast('Bevakningen borttagen'); }
+    saveRecs(); drawValue(r); updateWorth();
+  };
+  if ($('#dSell')) $('#dSell').onclick = () => openUrl(sellUrl(r));
+}
+// Hämtar pris i förgrunden. Vid fel sparas felet på skivan (priceErr) så att detaljvyn inte frågar igen direkt.
+async function priceNow(r) {
+  try { await fetchPrice(r, false); return true; }
+  catch (e) {
+    r.priceErrMsg = e.message;
+    if (e.status !== 429) { r.priceErr = Date.now(); saveRecs({ bg: true }); }
+    return false;
+  }
+}
+// Liten graf över skivans värde (prisförslag) över tid.
+function histSvg(r) {
+  const h = (r.priceHist || []).filter(x => x.c === (r.priceHist?.[r.priceHist.length - 1]?.c));
+  if (h.length < 2) return '';
+  const first = h[0], last = h[h.length - 1], diff = last.v - first.v;
+  return `<div class="m" style="margin-top:8px">Värdeutveckling sedan ${esc(new Date(first.t).toLocaleDateString('sv-SE'))}:
+    <b style="color:var(--fg)">${diff >= 0 ? '+' : '−'}${money(Math.abs(diff), last.c)}</b></div>` + sparkSvg(h);
+}
+// Linjegraf (en serie) som inline-SVG. Punkterna har title, så att man ser värde och datum vid hovring/tryck.
+function sparkSvg(pts) {
+  if (pts.length < 2) return '';
+  const W = 300, H = 64, P = 6;
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t || t0 + 1;
+  const vs = pts.map(p => p.v), lo = Math.min(...vs), hi = Math.max(...vs), span = hi - lo || 1;
+  const xy = pts.map(p => [P + (W - 2 * P) * (p.t - t0) / Math.max(1, t1 - t0), H - P - (H - 2 * P) * (p.v - lo) / span]);
+  const line = xy.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`).join('');
+  const area = `${line}L${xy[xy.length - 1][0].toFixed(1)},${H}L${xy[0][0].toFixed(1)},${H}Z`;
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Värde över tid">
+    <path class="a" d="${area}"/><path class="l" d="${line}" vector-effect="non-scaling-stroke"/>
+    ${xy.map(([x, y], i) => `<rect x="${(x - 8).toFixed(1)}" y="0" width="16" height="${H}" fill="transparent"><title>${esc(new Date(pts[i].t).toLocaleDateString('sv-SE'))}: ${esc(money(pts[i].v, pts[i].c).replace(/&[^;]+;/g, ''))}</title></rect>`).join('')}
+    </svg>`;
 }
 async function showVersions(r, masterId) {
   const box = $('#dVersList');
@@ -450,7 +638,8 @@ async function showVersions(r, masterId) {
       const x = vs[+el.dataset.i];
       r.rid = x.id;
       r.relLabel = [x.format, x.country, x.released, x.catno].filter(Boolean).join(' · ');
-      r.price = null; saveRecs(); drawValue(r);
+      // Ny utgåva = nytt pris och ny historik.
+      r.price = null; delete r.priceErr; delete r.priceHist; saveRecs(); drawValue(r);
     };
   } catch (e) { box.innerHTML = `<div class="m">${esc(e.message)}</div>`; }
 }
@@ -465,27 +654,28 @@ function render() {
   document.querySelector('[data-tab=all]').textContent = `Alla (${recs.length})`;
   document.querySelectorAll('[data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === view.tab));
   $('#btnView').textContent = view.mode === 'crate' ? '▦' : '▤';
-  const w = worthLine(); $('#worth').innerHTML = w; $('#worth').hidden = !w;
+  updateWorth();
   $('#crateView').hidden = view.mode !== 'crate';
   $('#gridView').hidden = view.mode === 'crate';
 
   const q = norm(view.q);
-  const list = sortRecs(recs.filter(r => (view.tab === 'all' || r.status === view.tab) && (!q || norm(r.artist + ' ' + r.title).includes(q))));
+  const list = sortRecs(recs.filter(r => (view.tab === 'all' || r.status === view.tab) && (!q || norm(r.artist + ' ' + r.title + ' ' + (r.loan?.to || '')).includes(q))));
   const emptyMsg = !recs.length
     ? `Backen är tom.<br>Tryck på <b>+</b> för att fota en skiva eller söka fram en.${!cfg.discogs ? '<br><br>Börja med att lägga in nycklarna under ⚙︎.' : ''}`
     : !list.length ? (q ? 'Inga träffar.' : view.tab === 'want' ? 'Önskelistan är tom.' : 'Inga skivor här än.') : '';
 
   if (view.mode === 'crate') { gridSig = ''; crateSet(list, emptyMsg); return; }
   // Rutnätet byggs bara om när något som syns har ändrats (inte när ett pris kommer in i bakgrunden).
-  const sig = view.tab + '\n' + emptyMsg + '\n' + list.map(r => [r.id, r.cover, r.title, r.artist, r.year].join('|')).join('\n');
+  const sig = view.tab + '\n' + emptyMsg + '\n' + list.map(r => [r.id, r.cover, r.title, r.artist, r.year, r.loan?.to, isDeal(r)].join('|')).join('\n');
   if (sig === gridSig) return;
   gridSig = sig;
   if (emptyMsg) { $('#list').innerHTML = `<div class="msg">${emptyMsg}</div>`; return; }
   $('#list').innerHTML = '<div class="grid">' + list.map(r => `
-    <button class="item" data-id="${r.id}">
+    <button class="item" data-id="${esc(r.id)}">
       ${r.cover ? `<img class="cover" loading="lazy" decoding="async" src="${esc(r.cover)}" alt="">` : '<div class="ph">♪</div>'}
       <div class="t">${esc(r.title)}</div>
-      <div class="m">${esc(r.artist)}${r.year ? ' · ' + r.year : ''}</div>
+      <div class="m">${esc(r.artist)}${r.year ? ' · ' + esc(r.year) : ''}</div>
+      ${r.loan ? `<div class="m">Utlånad till ${esc(r.loan.to)}</div>` : ''}${isDeal(r) ? '<div class="m" style="color:var(--sp)">Fynd!</div>' : ''}
     </button>`).join('') + '</div>';
 }
 $('#list').addEventListener('click', e => { const b = e.target.closest('.item'); if (b) openDetail(b.dataset.id); });
@@ -532,8 +722,9 @@ function crateSet(list, emptyMsg) {
   crate.idx = new Map(list.map((r, i) => [r.id, i]));
   $('#crateEmpty').innerHTML = emptyMsg || '';
   if (!same) {
-    const ids = new Set(list.map(r => r.id));
-    crate.els.forEach((el, id) => { if (!ids.has(id)) { el.remove(); crate.els.delete(id); } });
+    // Ta bort element för skivor som inte längre finns i listan eller har fått nytt omslag.
+    const byId = new Map(list.map(r => [r.id, r]));
+    crate.els.forEach((el, id) => { const r = byId.get(id); if (!r || (r.cover || '') !== el.dataset.cover) { el.remove(); crate.els.delete(id); } });
     const keep = curId ? list.findIndex(r => r.id === curId) : -1;
     crate.pos = keep >= 0 ? keep : clampPos(Math.round(crate.pos)) || 0;
     crate.target = null;
@@ -552,6 +743,7 @@ function crateEl(i) {
   if (el) return el;
   el = document.createElement('div');
   el.className = 'rec';
+  el.dataset.cover = r.cover || '';
   if (r.cover) {
     const img = new Image();
     img.alt = '';
@@ -563,10 +755,14 @@ function crateEl(i) {
     el.innerHTML = `<div class="sleeve"><b>${esc(r.title)}</b><span>${esc(r.artist)}</span></div>`;
   }
   if (r.status === 'want' && view.tab === 'all') el.insertAdjacentHTML('beforeend', '<span class="wantTag">Vill ha</span>');
+  if (r.loan) el.insertAdjacentHTML('beforeend', `<span class="loanTag">Utlånad till ${esc(r.loan.to)}</span>`);
+  else if (isDeal(r)) el.insertAdjacentHTML('beforeend', '<span class="loanTag dealTag">Fynd</span>');
   $('#stage').appendChild(el);
   crate.els.set(r.id, el);
   return el;
 }
+// Ritar om en skivas element i backen nästa gång (t.ex. när den lånats ut).
+function crateForget(id) { const el = crate.els.get(id); if (el) { el.remove(); crate.els.delete(id); crate.shown = -1; crateDraw(true); } }
 function crateDraw(force) {
   const { list, S } = crate, n = list.length, pos = crate.pos;
   if (!n) { crate.els.forEach(el => el.remove()); crate.els.clear(); updateNow(); return; }
@@ -607,7 +803,7 @@ function updateNow() {
   $('#now').style.visibility = r ? 'visible' : 'hidden';
   if (!r) { $('#curLetter').textContent = ''; return; }
   $('#nTitle').textContent = r.title;
-  $('#nArtist').textContent = r.artist + (r.year ? ' · ' + r.year : '') + (r.status === 'want' && view.tab === 'all' ? ' · Vill ha' : '');
+  $('#nArtist').textContent = r.artist + (r.year ? ' · ' + r.year : '') + (r.status === 'want' && view.tab === 'all' ? ' · Vill ha' : '') + (r.loan ? ' · utlånad till ' + r.loan.to : '');
   $('#nCount').textContent = `${Math.round(crate.pos) + 1} av ${crate.list.length}` + (LS.get('sh.flipped', false) ? '' : ' · dra nedåt för att bläddra');
   const L = letterOf(r);
   $('#curLetter').textContent = L;
@@ -689,14 +885,19 @@ addEventListener('resize', () => crateLayout());
 
 /* ---------------- Discogs ---------------- */
 // Gemensam takt för alla Discogs-anrop (gränsen är 60/min). Bakgrundsjobb får högst 40/min så att sökningar går fort.
-const dgLog = [];
+// Loggen sparas i telefonen, så att räkningen inte börjar om från noll när appen startar om
+// (Discogs räknar fortfarande senaste minuten).
+const dgLog = LS.get('sh.dglog', []).filter(t => Date.now() - t < 60000);
+let dgBlock = LS.get('sh.dgblock', 0);   // efter 429: vänta till den här tidpunkten
 async function dgSlot(bg) {
   for (;;) {
     const now = Date.now();
     while (dgLog.length && now - dgLog[0] > 60000) dgLog.shift();
     const gap = now - (dgLog[dgLog.length - 1] || 0);
-    if (dgLog.length < (bg ? 40 : 56) && gap >= (bg ? 1200 : 200)) { dgLog.push(now); return; }
-    await new Promise(r => setTimeout(r, bg ? 1200 : 250));
+    if (now >= dgBlock && dgLog.length < (bg ? 40 : 56) && gap >= (bg ? 1200 : 200)) {
+      dgLog.push(now); LS.set('sh.dglog', dgLog); return;
+    }
+    await new Promise(r => setTimeout(r, now < dgBlock ? Math.min(dgBlock - now, 5000) : bg ? 1200 : 250));
   }
 }
 async function dg(path, params = {}, opt = {}) {
@@ -707,6 +908,7 @@ async function dg(path, params = {}, opt = {}) {
   await dgSlot(opt.bg);
   const r = await fetch(u);
   if (!r.ok) {
+    if (r.status === 429) { dgBlock = Date.now() + 30000; LS.set('sh.dgblock', dgBlock); }
     const body = await r.json().catch(() => ({}));
     const e = new Error(r.status === 401 ? 'Discogs godkände inte token. Kolla den under ⚙︎.'
       : r.status === 429 ? 'Discogs: för många sökningar just nu, vänta en minut.'
@@ -730,7 +932,8 @@ function toCand(r) {
     ...splitTitle(r.title), year: parseInt(r.year) || null,
     cover: img(r.cover_image), thumb: img(r.thumb) || img(r.cover_image),
     format: [...new Set(r.format || [])].slice(0, 3).join(', '),
-    label: (r.label || [])[0] || '', country: r.country || '', catno: r.catno || ''
+    label: (r.label || [])[0] || '', country: r.country || '', catno: r.catno || '',
+    ...(r.genre?.length ? { genre: r.genre.slice(0, 3), style: (r.style || []).slice(0, 4) } : {})
   };
 }
 
@@ -777,7 +980,7 @@ Om du känner igen omslaget utan text, fyll i artist och title ändå.`;
   const models = cfg.geminiModel ? [cfg.geminiModel, ...GEMINI_MODELS.filter(m => m !== cfg.geminiModel)] : GEMINI_MODELS;
   let last = '';
   for (const model of models) {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    const call = () => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-goog-api-key': cfg.gemini },
       body: JSON.stringify({
@@ -785,6 +988,8 @@ Om du känner igen omslaget utan text, fyll i artist och title ändå.`;
         generationConfig: { responseMimeType: 'application/json', temperature: 0 }
       })
     });
+    let r = await call();
+    if (r.status === 503) { await sleepMs(1500); r = await call(); }   // ett omförsök på samma modell först
     const j = await r.json().catch(() => ({}));
     if (r.ok) {
       gemCount(1);
@@ -796,9 +1001,11 @@ Om du känner igen omslaget utan text, fyll i artist och title ändå.`;
     if (r.status === 400 && /API key/i.test(j.error?.message || '')) throw new Error('Gemini godkände inte nyckeln. Kolla den under ⚙︎.');
     // 429 = dagens gratisanrop slut för modellen, 404 = modellen finns inte. Prova nästa (egen kvot per modell).
     last = j.error?.message || String(r.status);
-    if (r.status !== 429 && r.status !== 404 && r.status !== 403) break;
+    // 500/503 = tillfälligt fel eller överbelastad modell (vanligt på gratisnivån): prova nästa modell.
+    if (![429, 404, 403, 500, 503].includes(r.status)) break;
   }
-  throw new Error(/quota|429|exhausted/i.test(last) ? 'Dagens gratisanrop till Gemini är slut.' : 'Gemini: ' + last);
+  throw new Error(/quota|429|exhausted/i.test(last) ? 'Dagens gratisanrop till Gemini är slut.'
+    : /overload|unavailable|503|500/i.test(last) ? 'Gemini är överbelastat just nu. Försök igen om en stund.' : 'Gemini: ' + last);
 }
 async function findFromInfo(info) {
   const tries = [];
@@ -971,6 +1178,8 @@ function drawDetail() {
       <h2>${esc(r.title)}</h2>
       <div>${esc(r.artist)}</div>
       <div class="m">${esc(meta)}</div>
+      ${r.genre?.length ? `<div class="m">${esc([...r.genre, ...(r.style || [])].join(' · '))}</div>` : ''}
+      ${r.lastPlayed ? `<div class="m">Senast spelad ${esc(new Date(r.lastPlayed).toLocaleDateString('sv-SE'))}</div>` : ''}
       <div class="actions">
         <button class="play" id="dPlay">▶ Spela i Spotify</button>
         <div class="split">
@@ -979,12 +1188,14 @@ function drawDetail() {
         </div>
       </div>
       <p class="note">Sorteras under <b id="dSort"></b>${/^(the|a)\s/i.test(r.artist) || r.artist.trim().split(/\s+/).length < 2 ? '' : ' · <a href="#" id="dSortBtn">ändra</a>'}</p>
+      <div class="valbox" id="dLoan"></div>
       <div class="valbox" id="dVal"></div>
       <p class="note" id="dSp">${r.spotifyName ? 'Spotify: ' + esc(r.spotifyName) : sp ? '' : 'Spela öppnar en sökning i Spotify. Logga in på Spotify under ⚙︎ för att hamna direkt på albumet.'}</p>
       <div class="tracks" id="dTracks"><div class="msg"><span class="spin"></span>Hämtar låtlistan…</div></div>
       <div class="actions">
         ${sp ? '<button id="dFix">Fel album i Spotify? Välj ett annat</button><div id="dAlts"></div>' : ''}
         ${r.dId ? `<button id="dDiscogs">Visa på Discogs</button>` : ''}
+        ${r.artist && !/^various/i.test(r.artist) ? `<button id="dMissing">Vad saknas av ${esc(r.artist)}?</button>` : ''}
         <button class="danger" id="dDel">Ta bort</button>
       </div>
     </div>`;
@@ -1004,13 +1215,45 @@ function drawDetail() {
   if ($('#dFix')) $('#dFix').onclick = showAlts;
   $('#dDel').onclick = e => {
     if (!e.target.dataset.sure) { e.target.dataset.sure = 1; e.target.textContent = 'Tryck igen för att ta bort'; return; }
-    recs = recs.filter(x => x !== r); saveRecs(); closeDetail(); render(); toast('Borttagen');
+    recs = recs.filter(x => x !== r); markDeleted(r.id); saveRecs(); closeDetail(); render(); toast('Borttagen');
   };
+  if ($('#dMissing')) $('#dMissing').onclick = () => { closeDetail(); openMissing(r.artist); };
   if (r.tracks) drawTracks();
+  drawLoan(r);
   drawValue(r);
 }
+// Utlånad till: namn och datum. Visas som märke på omslaget och i statistiken.
+function drawLoan(r) {
+  const box = $('#dLoan'); if (!box) return;
+  if (r.status !== 'have' && !r.loan) { box.hidden = true; return; }
+  box.hidden = false;
+  if (r.loan) {
+    const days = Math.floor((Date.now() - r.loan.at) / DAY);
+    box.innerHTML = `<div class="m">Utlånad</div>
+      <div style="font-weight:700;margin-top:2px">${esc(r.loan.to)}</div>
+      <div class="m">sedan ${esc(new Date(r.loan.at).toLocaleDateString('sv-SE'))}${days > 0 ? ` (${days} ${days === 1 ? 'dag' : 'dagar'})` : ''}</div>
+      <div class="actions" style="margin-top:8px"><button id="dReturn">Tillbakalämnad</button></div>`;
+    $('#dReturn').onclick = () => { delete r.loan; saveRecs(); crateForget(r.id); render(); drawLoan(r); toast('Tillbaka i backen'); };
+  } else {
+    const names = [...new Set(recs.map(x => x.loanLast).filter(Boolean))].slice(0, 20);
+    box.innerHTML = `<div class="m">Låna ut</div>
+      <div class="inl"><input id="dLoanTo" list="loanNames" placeholder="Till vem?" autocomplete="off"><button id="dLoanSave">Låna ut</button></div>
+      <datalist id="loanNames">${names.map(n => `<option value="${esc(n)}">`).join('')}</datalist>`;
+    $('#dLoanSave').onclick = () => {
+      const to = $('#dLoanTo').value.trim().slice(0, 60); if (!to) { $('#dLoanTo').focus(); return; }
+      r.loan = { to, at: Date.now() }; r.loanLast = to;
+      saveRecs(); crateForget(r.id); render(); drawLoan(r); toast(`Utlånad till ${to}`);
+    };
+  }
+}
+function markDeleted(id) {
+  deleted[id] = Date.now();
+  // Glöm borttagningar äldre än två år, så att listan inte växer för evigt.
+  for (const [k, t] of Object.entries(deleted)) if (t < Date.now() - 730 * DAY) delete deleted[k];
+  LS.set('sh.deleted', deleted);
+}
 function setStatus(s) {
-  cur.status = s; saveRecs(); render();
+  cur.status = s; saveRecs(); render(); drawLoan(cur); drawValue(cur);
   $('#dHave').classList.toggle('on', s === 'have'); $('#dWant').classList.toggle('on', s === 'want');
   toast(s === 'have' ? 'Flyttad till Har' : 'Flyttad till Vill ha');
 }
@@ -1019,12 +1262,13 @@ $('#detail').addEventListener('click', e => { if (e.target.id === 'detail') clos
 
 async function loadTracks(r) {
   if (r.tracks) return;
+  if (!r.dId) { if (cur === r) $('#dTracks').innerHTML = '<div class="msg">Ingen låtlista.</div>'; return; }
   try {
     const path = r.dType === 'master' ? `/masters/${r.dId}` : `/releases/${r.dId}`;
     const j = await dg(path);
     r.tracks = (j.tracklist || []).map(t => ({ p: t.position || '', t: t.title || '', d: t.duration || '', h: t.type_ === 'heading' }));
-    if (!r.year && j.year) r.year = j.year;
-    saveRecs();
+    if (applyInfo(r, j)) scheduleRender(true);
+    saveRecs({ bg: true });
     if (cur === r) drawTracks();
   } catch (e) {
     if (cur === r) $('#dTracks').innerHTML = `<div class="msg">${esc(e.message)}</div>`;
@@ -1047,10 +1291,12 @@ async function spLogin() {
   saveCfg();
   const verifier = b64url(crypto.getRandomValues(new Uint8Array(48)));
   LS.set('sh.pkce', verifier);
+  const state = b64url(crypto.getRandomValues(new Uint8Array(16)));   // skydd mot förfalskade inloggningssvar
+  LS.set('sh.spstate', state);
   const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
   const u = new URL('https://accounts.spotify.com/authorize');
   Object.entries({ client_id: cfg.spClient, response_type: 'code', redirect_uri: REDIRECT,
-    code_challenge_method: 'S256', code_challenge: challenge }).forEach(([k, v]) => u.searchParams.set(k, v));
+    code_challenge_method: 'S256', code_challenge: challenge, state }).forEach(([k, v]) => u.searchParams.set(k, v));
   location.href = u;
 }
 async function spTokenCall(body) {
@@ -1059,7 +1305,7 @@ async function spTokenCall(body) {
     body: new URLSearchParams({ client_id: cfg.spClient, ...body })
   });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error_description || j.error || 'Spotify ' + r.status);
+  if (!r.ok) { const e = new Error(j.error_description || j.error || 'Spotify ' + r.status); e.status = r.status; e.code = j.error; throw e; }
   sp = { access: j.access_token, refresh: j.refresh_token || sp?.refresh, exp: Date.now() + j.expires_in * 1000 };
   LS.set('sh.sp', sp);
 }
@@ -1067,14 +1313,22 @@ async function spAccess() {
   if (!sp) return null;
   if (Date.now() < sp.exp - 60000) return sp.access;
   try { await spTokenCall({ grant_type: 'refresh_token', refresh_token: sp.refresh }); return sp.access; }
-  catch { sp = null; LS.set('sh.sp', null); return null; }
+  catch (e) {
+    // Logga bara ut om Spotify säger att inloggningen inte gäller längre – inte vid nätfel.
+    if (e.code === 'invalid_grant' || e.status === 400 || e.status === 401) { sp = null; LS.set('sh.sp', null); }
+    return null;
+  }
 }
 async function spGet(path) {
-  const tok = await spAccess(); if (!tok) return null;
-  const r = await fetch('https://api.spotify.com/v1' + path, { headers: { Authorization: 'Bearer ' + tok } });
-  if (r.status === 401) { sp.exp = 0; return null; }
-  if (!r.ok) throw new Error('Spotify ' + r.status);
-  return r.json();
+  for (let attempt = 0; ; attempt++) {
+    const tok = await spAccess(); if (!tok) return null;
+    const r = await fetch('https://api.spotify.com/v1' + path, { headers: { Authorization: 'Bearer ' + tok } });
+    if (r.status === 401) { if (sp) sp.exp = 0; if (attempt) return null; continue; }
+    // För många anrop: vänta så länge Spotify säger (Retry-After) och försök igen.
+    if (r.status === 429 && attempt < 3) { await sleepMs(Math.min(60, +r.headers.get('Retry-After') || 5) * 1000 + 500); continue; }
+    if (!r.ok) { const e = new Error('Spotify ' + r.status); e.status = r.status; throw e; }
+    return r.json();
+  }
 }
 async function spAlbums(r) {
   let j = await spGet('/search?type=album&limit=10&q=' + encodeURIComponent(`album:${r.title} artist:${r.artist}`));
@@ -1090,22 +1344,27 @@ async function matchSpotify(r) {
     const best = items.find(x => norm(x.name) === t && x.artists.some(y => norm(y.name) === a))
       || items.find(x => norm(x.name).includes(t) && x.artists.some(y => norm(y.name).includes(a) || a.includes(norm(y.name))))
       || items[0];
-    if (best) { r.spotifyId = best.id; r.spotifyName = `${best.name} – ${best.artists.map(y => y.name).join(', ')}`; r.spTracks = null; saveRecs(); }
+    if (best) { r.spotifyId = best.id; r.spotifyName = `${best.name} – ${best.artists.map(y => y.name).join(', ')}`; r.spTracks = null; }
+    else r.spTried = Date.now();
+    saveRecs({ bg: true });
     if (cur === r) { const el = $('#dSp'); if (el) el.textContent = r.spotifyName ? 'Spotify: ' + r.spotifyName : ''; }
   } catch {}
 }
+function markPlayed(r) { r.lastPlayed = Date.now(); saveRecs({ bg: true }); }
 function playAlbum(r) {
+  markPlayed(r);
   if (r.spotifyId) openUrl('https://open.spotify.com/album/' + r.spotifyId);
   else openUrl('https://open.spotify.com/search/' + encodeURIComponent(`${r.artist} ${r.title}`));
 }
 async function playTrack(r, t) {
+  markPlayed(r);
   const fallback = () => openUrl('https://open.spotify.com/search/' + encodeURIComponent(`${r.artist} ${t.t}`));
   if (!r.spotifyId || !sp) return fallback();
   try {
     if (!r.spTracks) {
       const j = await spGet(`/albums/${r.spotifyId}/tracks?limit=50`);
       if (!j) return fallback();
-      r.spTracks = j.items.map(x => ({ id: x.id, n: norm(x.name) })); saveRecs();
+      r.spTracks = j.items.map(x => ({ id: x.id, n: norm(x.name) })); saveRecs({ bg: true });
     }
     const n = norm(t.t);
     const hit = r.spTracks.find(x => x.n === n) || r.spTracks.find(x => x.n.startsWith(n) || n.startsWith(x.n));
@@ -1128,8 +1387,20 @@ async function showAlts() {
     };
   } catch (e) { box.innerHTML = `<div class="msg">${esc(e.message)}</div>`; }
 }
+// Kopplar skivor utan Spotify-album, i lugn takt. Körs efter inloggning och när bakgrundsjobbet mot Discogs är klart.
+// Skivor utan träff provas igen efter en vecka.
+let spMatching = false;
 async function matchAll() {
-  for (const r of recs.filter(r => !r.spotifyId)) { await matchSpotify(r); await new Promise(res => setTimeout(res, 300)); }
+  if (!sp || spMatching) return;
+  spMatching = true;
+  try {
+    for (const r of recs.filter(r => !r.spotifyId && !(r.spTried > Date.now() - 7 * DAY))) {
+      if (!sp) break;
+      if (!recs.includes(r) || r.spotifyId) continue;
+      await matchSpotify(r);
+      await sleepMs(400);
+    }
+  } finally { spMatching = false; persistRecs(); }
 }
 
 /* ---------------- Inställningar ---------------- */
@@ -1158,7 +1429,7 @@ function closeSettings() {
   cfg.cond = $('#defCond').value;
   cfg.gemini = $('#geminiKey').value.trim();
   cfg.spClient = $('#spClient').value.trim();
-  saveCfg(); render();
+  saveCfg(); render(); kickBg();
   $('#settings').classList.remove('open');
 }
 $('#btnSettings').onclick = openSettings;
@@ -1169,13 +1440,30 @@ $('#btnExport').onclick = () => {
   $('#backup').select(); toast('Markera allt och kopiera texten');
 };
 $('#btnImport').onclick = () => {
-  try { const n = mergeBackup(JSON.parse($('#backup').value)); toast(`${n} skivor importerade`); }
+  try { toast(mergeMsg(mergeBackup(JSON.parse($('#backup').value)))); }
   catch (e) { toast(e instanceof SyntaxError ? 'Det där ser inte ut som en backup.' : e.message); }
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-15';
+const WEB_VERSION = '2026-11-16';
 const CHANGELOG = [
+  { d: '2026-11-16', t: 'Statistik, utlåning, prisbevakning och slumpen', i: [
+    'Ny: 📊 Statistik – decennier, genrer, skivbolag, artister, tillagda per månad, dyraste skivorna och samlingens värde över tid.',
+    'Ny: 🎲 Slumpa en skiva bland de som syns, helst en du inte spelat på länge. Appen minns när du senast spelade en skiva.',
+    'Ny: Låna ut en skiva – vem som har den och sedan när. Syns på omslaget och i statistiken.',
+    'Ny: Prisbevakning på önskelistan – säg ett pris så kollas Discogs varje dygn och du ser när någon säljer under det.',
+    'Ny: Värdeutveckling per skiva och "Största värdeökningar".',
+    'Ny: "Vad saknas av …?" visar album av en artist som du inte har, med knapp till önskelistan.',
+    'Säkrare backup: automatisk backup blir inte längre fördröjd av prishämtningen och sparas direkt när du lämnar appen.',
+    'Säkrare backup: hämta backup skapar inte dubbletter, väcker inte borttagna skivor och kontrollerar innehållet i filen.',
+    'Varning om telefonens minne är fullt och skivor inte kan sparas.',
+    'Utan nät eller när Discogs krånglar pausar bakgrundsjobbet i stället för att hoppa över skivorna i ett dygn.',
+    'Snabbskanningen försöker igen vid "för många sökningar" och sparar annars koden så att du kan söka igen senare.',
+    '"Uppdatera pris" tappar inte det gamla priset om hämtningen misslyckas.',
+    'Spotify loggar inte ut vid tillfälliga nätfel, väntar vid "för många anrop" och kopplar album till fler skivor i bakgrunden.',
+    'Gemini provar nästa modell när en är överbelastad.',
+    'Mjukare bläddring medan priser hämtas.',
+    'Android-appen (v4): tar hand om foto och backup om telefonen stängt appen medan kameran eller filväljaren var öppen, och bara Skivbacken kan använda appens funktioner.' ] },
   { d: '2026-11-15', t: 'Stabilare och lättare', i: [
     'Rättat: appen kunde låsa sig om ett pris hämtades samtidigt i bakgrunden, t.ex. vid "Uppdatera pris".',
     'Skivbacken använder mindre minne: bara omslagen närmast dig hålls redo.',
@@ -1226,24 +1514,92 @@ let scanQueue = LS.get('sh.queue', []);
 const saveQueue = () => { LS.set('sh.queue', scanQueue); autoBackup(); };
 function backupJson() {
   const { ...c } = cfg;
-  return JSON.stringify({ app: 'skivbacken', v: 2, saved: new Date().toISOString(),
-    recs: recs.map(({ spTracks, ...r }) => r), cfg: c, artistInfo, queue: scanQueue });
+  return JSON.stringify({ app: 'skivbacken', v: 3, saved: new Date().toISOString(),
+    recs: recs.map(({ spTracks, ...r }) => r), cfg: c, artistInfo, queue: scanQueue, deleted,
+    worthHist: LS.get('sh.worthHist', []) });
 }
+/* En post från en backupfil eller textimport kan vara manipulerad: kontrollera typerna innan den används,
+   så att inget kan smyga in HTML/skript via t.ex. id eller årtal. */
+const ID_RE = /^[\w-]{1,40}$/;
+const str = (v, max = 300) => typeof v === 'string' ? v.slice(0, max) : v == null ? '' : String(v).slice(0, max);
+const num = v => Number.isFinite(+v) && +v > 0 ? +v : null;
+function cleanRec(r) {
+  if (!r || typeof r !== 'object' || typeof r.title !== 'string' || !r.title.trim()) return null;
+  const o = { ...r };
+  o.id = typeof r.id === 'string' && ID_RE.test(r.id) ? r.id : uid();
+  o.title = str(r.title); o.artist = str(r.artist);
+  o.status = r.status === 'want' ? 'want' : 'have';
+  o.year = parseInt(r.year) || null;
+  for (const k of ['dId', 'rid', 'masterId', 'added', 'lastPlayed', 'watch']) if (o[k] != null) o[k] = num(o[k]);
+  if (o.dType !== 'master' && o.dType !== 'release') delete o.dType;
+  for (const k of ['cover', 'thumb']) if (o[k] && !/^https:\/\//.test(o[k])) delete o[k];
+  for (const k of ['format', 'label', 'country', 'catno', 'relLabel', 'spotifyName', 'sortAs', 'cond', 'loanLast']) if (k in o) o[k] = str(o[k]);
+  if (o.spotifyId && !/^\w{1,40}$/.test(o.spotifyId)) delete o.spotifyId;
+  if (o.loan) o.loan = o.loan.to ? { to: str(o.loan.to, 60), at: num(o.loan.at) || Date.now() } : undefined;
+  for (const k of ['genre', 'style']) if (k in o) o[k] = Array.isArray(o[k]) ? o[k].map(x => str(x, 40)).slice(0, 4) : [];
+  if (o.tracks && !Array.isArray(o.tracks)) delete o.tracks;
+  if (o.priceHist && !Array.isArray(o.priceHist)) delete o.priceHist;
+  if (o.price) o.price = cleanPrice(o.price);
+  return o;
+}
+function cleanPrice(p) {
+  if (!p || typeof p !== 'object') return null;
+  const sug = p.sug && typeof p.sug === 'object' ? Object.fromEntries(Object.entries(p.sug)
+    .filter(([k, v]) => CONDS.some(c => c[0] === k) && v && num(v.v)).map(([k, v]) => [k, { v: num(v.v), c: str(v.c, 3) }])) : null;
+  return { at: num(p.at) || 0, rid: num(p.rid), sug: sug && Object.keys(sug).length ? sug : null,
+    low: p.low && num(p.low.v) ? { v: num(p.low.v), c: str(p.low.c, 3) } : null, n: Math.round(num(p.n) || 0) };
+}
+// Samma skiva: samma id, eller samma Discogs-post (eller samma exakta utgåva).
+const sameRec = (a, b) => a.id === b.id || (a.dId && a.dId === b.dId && a.dType === b.dType) || (a.rid && a.rid === b.rid && a.dId === b.dId);
 function mergeBackup(data) {
-  const list = Array.isArray(data) ? data : data.recs;
+  const list = Array.isArray(data) ? data : data?.recs;
   if (!Array.isArray(list)) throw new Error('Hittade inga skivor i backupen.');
-  let n = 0;
-  for (const r of list) if (r && r.title && !recs.some(x => x.id === r.id)) { recs.push(r); n++; }
-  if (data.cfg) for (const [k, v] of Object.entries(data.cfg)) if (v && !cfg[k]) cfg[k] = v;
-  if (data.artistInfo) artistInfo = { ...data.artistInfo, ...artistInfo };
-  if (Array.isArray(data.queue)) for (const q of data.queue) if (!scanQueue.some(x => x.id === q.id)) scanQueue.push(q);
-  LS.set('sh.artists', artistInfo); LS.set('sh.queue', scanQueue);
+  // Borttagningar från den andra telefonen/filen följer med, så att de inte väcks igen.
+  if (data.deleted && typeof data.deleted === 'object')
+    for (const [k, t] of Object.entries(data.deleted)) if (ID_RE.test(k) && num(t) && !(deleted[k] > t)) deleted[k] = num(t);
+  let added = 0, merged = 0;
+  for (const raw of list) {
+    const r = cleanRec(raw); if (!r) continue;
+    if (deleted[r.id]) continue;
+    const x = recs.find(y => sameRec(y, r));
+    if (!x) { recs.push(r); added++; continue; }
+    // Finns redan: behåll det lokala och fyll bara på det som saknas (pris, låtlista, Spotify, genre …).
+    merged++;
+    for (const [k, v] of Object.entries(r)) if (k !== 'id' && v != null && v !== '' && (x[k] == null || x[k] === '')) x[k] = v;
+    if (r.price?.at > (x.price?.at || 0)) x.price = r.price;
+    if (r.priceHist?.length) {
+      const byT = new Map([...(x.priceHist || []), ...r.priceHist].filter(p => p && num(p.t) && num(p.v)).map(p => [p.t, p]));
+      x.priceHist = [...byT.values()].sort((a, b) => a.t - b.t).slice(-52);
+    }
+  }
+  // Inställningar: bara kända fält, och bara de som saknas här.
+  const CFG_KEYS = ['discogs', 'gemini', 'spClient', 'cond', 'bkAuto', 'geminiModel'];
+  if (data.cfg && typeof data.cfg === 'object')
+    for (const k of CFG_KEYS) { const v = data.cfg[k]; if (v && !cfg[k] && (typeof v === 'string' || typeof v === 'boolean')) cfg[k] = v; }
+  if (data.artistInfo && typeof data.artistInfo === 'object')
+    for (const [name, v] of Object.entries(data.artistInfo))
+      if (!artistInfo[name] && v && typeof v === 'object') artistInfo[name] = { person: !!v.person, ...(num(v.id) ? { id: num(v.id) } : {}) };
+  if (Array.isArray(data.queue)) for (const q of data.queue) {
+    if (!q || !ID_RE.test(q.id) || deleted[q.id] || scanQueue.some(x => x.id === q.id)) continue;
+    scanQueue.push({ id: q.id, code: str(q.code, 20).replace(/\D/g, ''), at: num(q.at) || Date.now(),
+      cands: Array.isArray(q.cands) ? q.cands.map(cleanCand).filter(Boolean).slice(0, 5) : [], ...(q.retry ? { retry: true } : {}) });
+  }
+  if (Array.isArray(data.worthHist)) {
+    const h = LS.get('sh.worthHist', []), have = new Set(h.map(p => today_(p.t)));
+    for (const p of data.worthHist) if (p && num(p.t) && num(p.v) && !have.has(today_(p.t))) h.push({ t: num(p.t), v: num(p.v), c: str(p.c, 3), n: num(p.n) || 0 });
+    LS.set('sh.worthHist', h.sort((a, b) => a.t - b.t).slice(-400));
+  }
+  LS.set('sh.deleted', deleted); LS.set('sh.artists', artistInfo); LS.set('sh.queue', scanQueue);
   saveCfg(); saveRecs(); render();
-  return n;
+  return { added, merged };
 }
+const today_ = t => new Date(t).toLocaleDateString('sv-SE');
+// Kandidater i kön är som skivor fast utan id/status.
+const cleanCand = c => { const o = cleanRec({ ...c, id: 'x' }); if (o) { delete o.id; delete o.status; } return o; };
+const mergeMsg = ({ added, merged }) => `${added} nya skivor` + (merged ? `, ${merged} fanns redan (kompletterade)` : '');
 function bkInfo() {
   const b = LS.get('sh.bk', null);
-  const name = nativeVer() >= 3 ? App.backupName() : '';
+  const name = (nativeVer() >= 3 ? App.backupName() : '') || b?.name || '';
   $('#bkInfo').innerHTML = nativeVer() < 3
     ? 'Finns i Android-appen. Installera senaste versionen från GitHub (Releases).'
     : (b ? `Senaste backup: ${esc(new Date(b.at).toLocaleString('sv-SE', { dateStyle: 'short', timeStyle: 'short' }))}${name ? ' i ' + esc(name) : ''}.` : 'Ingen backup sparad än.')
@@ -1265,18 +1621,28 @@ async function driveLoad() {
   if (nativeVer() < 3) { toast('Installera senaste appversionen för att hämta från Drive.'); return; }
   try {
     const text = await native(id => App.loadBackup(id));
-    const n = mergeBackup(JSON.parse(text));
-    toast(`${n} skivor hämtade från backupen`);
+    toast(mergeMsg(mergeBackup(JSON.parse(text))), 4000);
     openSettings();
   } catch (e) {
     if (e.message !== 'cancel') toast(e instanceof SyntaxError ? 'Filen ser inte ut som en backup från Skivbacken.' : e.message, 4000);
   }
 }
-let autoT;
+// Automatisk backup 15 s efter senaste ändringen, men aldrig senare än 60 s efter den första,
+// och direkt när appen läggs i bakgrunden.
+let autoT = 0, autoFirst = 0;
 function autoBackup() {
   if (!cfg.bkAuto || nativeVer() < 3) return;
-  clearTimeout(autoT); autoT = setTimeout(() => driveSave('auto'), 15000);
+  const now = Date.now(); if (!autoFirst) autoFirst = now;
+  clearTimeout(autoT);
+  autoT = setTimeout(runAutoBackup, Math.max(0, Math.min(15000, autoFirst + 60000 - now)));
 }
+function runAutoBackup() { clearTimeout(autoT); autoT = 0; autoFirst = 0; driveSave('auto'); }
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { checkPending(); return; }
+  if (bgSaveT) persistRecs();
+  if (autoT) runAutoBackup();
+});
+addEventListener('pagehide', () => { if (bgSaveT) persistRecs(); });
 $('#bkSave').onclick = () => driveSave('save');
 $('#bkPick').onclick = () => driveSave('pick');
 $('#bkLoad').onclick = driveLoad;
@@ -1290,6 +1656,10 @@ function addRecFromCand(c, status) {
   recs.push(rec); saveRecs();
   matchSpotify(rec);
   return rec;
+}
+function dropQueue(i) {
+  const q = scanQueue[i]; if (!q) return;
+  markDeleted(q.id); scanQueue.splice(i, 1); saveQueue();
 }
 const findExisting = c => recs.find(r => r.dId === c.dId || (c.masterId && r.masterId === c.masterId));
 let batching = false;
@@ -1314,9 +1684,14 @@ async function batchScan() {
       if (!code) continue;
       st.scanned++;
       box('<span class="spin"></span>Söker…', 'Streckkod ' + esc(code));
-      let cands = [];
-      try { cands = (await dgSearch({ barcode: code, type: 'release' })).map(toCand); }
-      catch (e) { box(esc(e.message)); await sleep(2500); if (/för många/.test(e.message)) await sleep(30000); }
+      const res = await searchBarcode(code, (msg, wait) => box(`<span class="spin"></span>${esc(msg)}`, `Försöker igen om ${Math.round(wait / 1000)} s · streckkod ${esc(code)}`));
+      const cands = res.cands;
+      if (res.err) {
+        // Gick inte att söka (inget nät, Discogs nere eller för många anrop): spara koden och sök om senare.
+        scanQueue.push({ id: uid(), code, cands: [], at: Date.now(), retry: true }); saveQueue();
+        st.review++; box('Kunde inte söka just nu', 'Lagd i "Att granska" – tryck "Sök igen" senare');
+        await sleep(1100); continue;
+      }
       const masters = new Set(cands.map(c => c.masterId || 'r' + c.dId));
       const ex = cands[0] && findExisting(cands[0]);
       if (ex) { st.dup++; box('Fanns redan: ' + esc(ex.title), esc(ex.artist)); }
@@ -1335,17 +1710,31 @@ async function batchScan() {
     render(); renderQueue(); setTimeout(resolveArtists, 1500);
   }
 }
+// Söker på en streckkod. Vid för många anrop, nätfel eller fel hos Discogs väntar den och försöker igen (högst 3 gånger).
+async function searchBarcode(code, onWait = () => {}) {
+  for (let attempt = 0; ; attempt++) {
+    try { return { cands: (await dgSearch({ barcode: code, type: 'release' })).map(toCand) }; }
+    catch (e) {
+      const retry = e.status === 429 || !e.status || e.status >= 500;
+      if (!retry || attempt >= 2) return { cands: [], err: e };
+      const wait = e.status === 429 ? 30000 : 4000;
+      onWait(e.message, wait);
+      await sleepMs(wait);
+    }
+  }
+}
 function renderQueue() {
   const el = $('#queueBox');
   if (!scanQueue.length) { el.innerHTML = ''; return; }
   el.innerHTML = `<div class="qhead">Att granska (${scanQueue.length})</div>` + scanQueue.map((q, qi) => `
     <div class="qitem">
-      <div class="m">Streckkod ${esc(q.code)}${q.cands.length ? ' · vilken är det?' : ' · hittades inte i Discogs'}</div>
+      <div class="m">Streckkod ${esc(q.code)}${q.cands.length ? ' · vilken är det?' : q.retry ? ' · kunde inte sökas' : ' · hittades inte i Discogs'}</div>
       ${q.cands.map((c, ci) => `<div class="cand">
         ${c.thumb ? `<img src="${esc(c.thumb)}" alt="">` : '<div class="ph">♪</div>'}
         <div><div class="t">${esc(c.title)}</div><div class="m">${esc(c.artist)} · ${esc([c.year, c.format, c.country].filter(Boolean).join(' · '))}</div>
           <div class="btns"><button data-q="${qi}" data-c="${ci}" data-s="have" class="on">Har den</button><button data-q="${qi}" data-c="${ci}" data-s="want">Vill ha</button></div></div></div>`).join('')}
       <div class="btns" style="display:flex;gap:6px;margin-top:6px">
+        ${q.retry ? `<button data-retry="${qi}">Sök igen</button>` : ''}
         ${q.cands.length ? '' : `<button data-search="${qi}">Sök med text</button>`}
         <button data-del="${qi}">Ta bort</button>
       </div>
@@ -1353,23 +1742,250 @@ function renderQueue() {
 }
 $('#queueBox').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
-  if (b.dataset.del != null) { scanQueue.splice(+b.dataset.del, 1); saveQueue(); renderQueue(); return; }
+  if (b.dataset.del != null) { dropQueue(+b.dataset.del); renderQueue(); return; }
+  if (b.dataset.retry != null) {
+    const q = scanQueue[+b.dataset.retry]; if (!q) return;
+    b.disabled = true; b.innerHTML = '<span class="spin"></span>Söker…';
+    searchBarcode(q.code).then(res => {
+      if (res.err) { toast(res.err.message, 4000); renderQueue(); return; }
+      q.cands = res.cands.slice(0, 5); delete q.retry;
+      // Säker träff (ett enda album) läggs in direkt, som vid snabbskanningen.
+      const masters = new Set(res.cands.map(c => c.masterId || 'r' + c.dId));
+      if (res.cands.length && masters.size === 1 && !findExisting(res.cands[0])) {
+        const rec = addRecFromCand(res.cands[0], 'have');
+        dropQueue(scanQueue.indexOf(q)); render(); toast(`${rec.title} är tillagd`); setTimeout(resolveArtists, 1500);
+      } else saveQueue();
+      renderQueue();
+    });
+    return;
+  }
   if (b.dataset.search != null) {
-    scanQueue.splice(+b.dataset.search, 1); saveQueue(); renderQueue();
+    dropQueue(+b.dataset.search); renderQueue();
     $('#aq').value = ''; $('#aq').focus(); toast('Skriv artist och album och tryck sök'); return;
   }
   const q = scanQueue[+b.dataset.q]; if (!q) return;
   const c = q.cands[+b.dataset.c];
   const rec = addRecFromCand(c, b.dataset.s);
-  scanQueue.splice(+b.dataset.q, 1); saveQueue(); renderQueue(); render();
+  dropQueue(+b.dataset.q); renderQueue(); render();
   toast(`${rec.title} är tillagd`);
   setTimeout(resolveArtists, 1500);
 });
 $('#btnBatch').onclick = batchScan;
 
+/* ---------------- Slumpa en skiva ---------------- */
+// Slumpar bland skivorna som syns just nu (flik och sökning), helst en som inte spelats på 60 dagar.
+$('#btnRandom').onclick = () => {
+  const list = view.mode === 'crate' ? crate.list
+    : sortRecs(recs.filter(r => (view.tab === 'all' || r.status === view.tab)));
+  if (!list.length) { toast('Inga skivor att slumpa bland.'); return; }
+  const fresh = list.filter(r => !(r.lastPlayed > Date.now() - 60 * DAY));
+  const pool = fresh.length ? fresh : list;
+  const r = pool[Math.floor(Math.random() * pool.length)];
+  if (view.mode === 'crate') {
+    const i = crate.list.indexOf(r);
+    // Hoppa nästan ända fram och bläddra de sista skivorna, så att det syns utan att hundratals omslag laddas.
+    crate.target = null;
+    crate.pos = clampPos(i + (i >= crate.pos ? -12 : 12));
+    crateDraw(true);
+    crateGo(i);
+    toast(`🎲 ${r.title} – ${r.artist}`);
+  } else openDetail(r.id);
+};
+
+/* ---------------- Statistik ---------------- */
+const statsOpen = () => $('#statsSheet').classList.contains('open');
+const closeStats = () => $('#statsSheet').classList.remove('open');
+$('#statsSheet').addEventListener('click', e => {
+  if (e.target.id === 'statsSheet') { closeStats(); return; }
+  const ri = e.target.closest('[data-rid]');
+  if (ri) { closeStats(); openDetail(ri.dataset.rid); return; }
+  const m = e.target.closest('[data-missing]');
+  if (m) { openMissing(m.dataset.missing); return; }
+  if (e.target.closest('#closeStats')) closeStats();
+});
+$('#btnStats').onclick = () => openStats();
+$('#worth').addEventListener('click', e => { const a = e.target.closest('[data-act=deals]'); if (a) { e.preventDefault(); openStats('deals'); } });
+
+function barRows(entries, fmt = v => v) {
+  const max = Math.max(1, ...entries.map(e => e[1]));
+  return `<div class="bars">${entries.map(([k, v, title]) => `
+    <span class="lb" title="${esc(title || k)}">${esc(k)}</span>
+    <div class="tr0" title="${esc((title || k) + ': ' + fmt(v))}"><div class="br" style="width:${(100 * v / max).toFixed(1)}%"></div></div>
+    <span class="vl">${esc(fmt(v))}</span>`).join('')}</div>`;
+}
+function recRows(list, right) {
+  return `<div class="rlist">${list.map(r => `
+    <div class="ri" data-rid="${esc(r.id)}">
+      ${r.thumb || r.cover ? `<img src="${esc(r.thumb || r.cover)}" alt="" loading="lazy">` : '<div class="ph">♪</div>'}
+      <div style="min-width:0"><div class="t" style="margin:0">${esc(r.title)}</div><div class="m">${esc(r.artist)}${r.year ? ' · ' + esc(r.year) : ''}</div></div>
+      <div class="x">${right(r)}</div></div>`).join('')}</div>`;
+}
+const countBy = (list, keyFn) => {
+  const m = new Map();
+  for (const r of list) for (const k of [].concat(keyFn(r) || [])) if (k) m.set(k, (m.get(k) || 0) + 1);
+  return [...m.entries()].sort((a, b) => b[1] - a[1] || cmpSv(a[0], b[0]));
+};
+function openStats(focus) {
+  const have = recs.filter(r => r.status === 'have'), want = recs.filter(r => r.status === 'want');
+  const valued = have.map(r => [r, valueOf(r)]).filter(x => x[1]);
+  const sums = {}; for (const [, v] of valued) sums[v.c] = (sums[v.c] || 0) + v.v;
+  const total = Object.entries(sums).sort((a, b) => b[1] - a[1]).map(([c, v]) => money(v, c)).join(' + ') || '–';
+  const loans = recs.filter(r => r.loan).sort((a, b) => a.loan.at - b.loan.at);
+  const deals = recs.filter(isDeal);
+  const watched = want.filter(r => r.watch && !isDeal(r));
+
+  // Decennier i ordning, inte efter antal.
+  const dec = countBy(have, r => r.year ? Math.floor(r.year / 10) * 10 + '-tal' : null).sort((a, b) => a[0].localeCompare(b[0]));
+  const genres = countBy(have, r => r.genre).slice(0, 8);
+  const genreMissing = have.filter(r => !r.genre).length;
+  const labels = countBy(have, r => r.label?.replace(/\s*\(\d+\)$/, '')).slice(0, 8);
+  const artists = countBy(have, r => /^various/i.test(r.artist) ? null : r.artist).slice(0, 8);
+  // Tillagda per månad, senaste 12 månaderna (även tomma månader).
+  const months = [];
+  for (let i = 11; i >= 0; i--) { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - i); months.push([d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'), 0]); }
+  const mi = new Map(months.map((m, i) => [m[0], i]));
+  for (const r of recs) if (r.added) { const d = new Date(r.added); const k = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'); if (mi.has(k)) months[mi.get(k)][1]++; }
+  const mName = k => new Date(k + '-01').toLocaleDateString('sv-SE', { month: 'short' }).replace('.', '');
+  const top = valued.sort((a, b) => b[1].v - a[1].v).slice(0, 10).map(x => x[0]);
+  const rises = have.map(r => {
+    const h = (r.priceHist || []).filter(p => p.c === r.priceHist[r.priceHist.length - 1].c);
+    return h.length >= 2 ? [r, h[h.length - 1].v - h[0].v, h[0].c] : null;
+  }).filter(x => x && x[1] > 0).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const wh = LS.get('sh.worthHist', []);
+  const whC = wh.length ? wh[wh.length - 1].c : null, whPts = wh.filter(p => p.c === whC);
+
+  $('#statsBody').innerHTML = `
+    <div class="row"><h2 style="flex:1">Statistik</h2><button id="closeStats">Stäng</button></div>
+    <div class="kpis">
+      <div class="kpi"><b>${have.length}</b><span>har</span></div>
+      <div class="kpi"><b>${want.length}</b><span>vill ha</span></div>
+      <div class="kpi"><b>${loans.length}</b><span>utlånade</span></div>
+    </div>
+    <div class="kpi" style="margin-top:8px"><span>Samlingens värde (${esc(condShort(cfg.cond || 'Very Good Plus (VG+)'))})</span><b>${total}</b>
+      <span>${valued.length} av ${have.length} värderade</span>
+      ${whPts.length >= 2 ? sparkSvg(whPts) + `<span>Sedan ${esc(new Date(whPts[0].t).toLocaleDateString('sv-SE'))}: ${money(whPts[0].v, whC)} → ${money(whPts[whPts.length - 1].v, whC)}</span>` : '<span style="display:block;margin-top:4px">Grafen fylls på allt eftersom priserna uppdateras.</span>'}
+    </div>
+
+    <h3 id="stDeals">Fynd på önskelistan</h3>
+    ${deals.length ? recRows(deals, r => `<b style="color:var(--sp)">${money(r.price.low.v, 'SEK')}</b><div class="m">gräns ${money(r.watch, 'SEK')}</div>`)
+      : `<p class="note">${watched.length ? `${watched.length} skivor bevakas, ingen under din gräns just nu.` : 'Öppna en skiva på önskelistan och skriv in ett pris under "Prisbevakning".'}</p>`}
+    ${watched.length ? recRows(watched, r => `${r.price?.low ? money(r.price.low.v, r.price.low.c) : '–'}<div class="m">gräns ${money(r.watch, 'SEK')}</div>`) : ''}
+
+    <h3>Utlånade</h3>
+    ${loans.length ? recRows(loans, r => `${esc(r.loan.to)}<div class="m">${esc(new Date(r.loan.at).toLocaleDateString('sv-SE'))}</div>`) : '<p class="note">Inga utlånade skivor.</p>'}
+
+    ${top.length ? `<h3>Dyraste skivorna</h3>${recRows(top, r => money(valueOf(r).v, valueOf(r).c))}` : ''}
+    ${rises.length ? `<h3>Största värdeökningar</h3>${recRows(rises.map(x => x[0]), r => { const x = rises.find(y => y[0] === r); return `+${money(x[1], x[2])}`; })}` : ''}
+
+    ${dec.length ? `<h3>Decennier</h3>${barRows(dec)}` : ''}
+    <h3>Genrer</h3>
+    ${genres.length ? barRows(genres) : ''}
+    ${genreMissing ? `<p class="note">${genreMissing} skivor saknar genre än – den hämtas från Discogs i bakgrunden.</p>` : ''}
+    ${labels.length ? `<h3>Skivbolag</h3>${barRows(labels)}` : ''}
+    ${artists.length ? `<h3>Mest representerade artister</h3>${barRows(artists)}
+      <p class="note">Se vad som saknas: ${artists.slice(0, 5).map(([a]) => `<a href="#" data-missing="${esc(a)}">${esc(a)}</a>`).join(' · ')}</p>` : ''}
+    <h3>Tillagda per månad</h3>${barRows(months.map(([k, v]) => [mName(k), v, k]))}
+  `;
+  $('#statsSheet').classList.add('open');
+  const panel = $('#statsSheet .panel');
+  panel.scrollTop = 0;
+  if (focus === 'deals') $('#stDeals').scrollIntoView({ block: 'start' });
+}
+
+/* ---------------- Saknas i diskografin ---------------- */
+// Hämtar artistens huvudsläpp (masters) från Discogs och visar vilka som inte finns i hyllan eller på önskelistan.
+const missingCache = new Map();
+async function artistIdOf(name) {
+  if (artistInfo[name]?.id) return artistInfo[name].id;
+  const r = recs.find(x => x.artist === name && x.dId);
+  if (!r) throw new Error('Hittar ingen skiva av artisten med Discogs-data.');
+  const j = await dg(r.dType === 'master' ? `/masters/${r.dId}` : `/releases/${r.dId}`);
+  const a = (j.artists || [])[0];
+  if (!a?.id) throw new Error('Discogs vet inte vilken artist det är.');
+  artistInfo[name] = { ...(artistInfo[name] || {}), id: a.id };
+  LS.set('sh.artists', artistInfo);
+  return a.id;
+}
+async function openMissing(name) {
+  closeStats();
+  $('#logBody').innerHTML = `<h2>Saknas av ${esc(name)}</h2><div id="missBody"><div class="msg"><span class="spin"></span>Hämtar diskografin från Discogs…</div></div>
+    <div class="actions"><button id="closeLog">Stäng</button></div>`;
+  $('#closeLog').onclick = closeLog;
+  $('#logSheet').classList.add('open');
+  try {
+    let items = missingCache.get(name);
+    if (!items) {
+      const id = await artistIdOf(name);
+      items = [];
+      for (let page = 1; page <= 3; page++) {
+        const j = await dg(`/artists/${id}/releases`, { sort: 'year', sort_order: 'asc', per_page: 100, page });
+        items.push(...(j.releases || []).filter(x => x.type === 'master' && (x.role || 'Main') === 'Main'));
+        if (!j.pagination || page >= j.pagination.pages) break;
+      }
+      missingCache.set(name, items);
+    }
+    drawMissing(name, items);
+  } catch (e) {
+    if ($('#missBody')) $('#missBody').innerHTML = `<div class="msg">${esc(e.message)}</div>`;
+  }
+}
+function drawMissing(name, items) {
+  const box = $('#missBody'); if (!box) return;
+  const mine = recs.filter(r => r.artist === name);
+  const owned = x => mine.find(r => r.masterId === x.id || (r.dType === 'master' && r.dId === x.id) || norm(r.title) === norm(x.title));
+  const hidden = new Set(LS.get('sh.missHide', []));
+  const miss = items.filter(x => !owned(x) && !hidden.has(x.id));
+  const have = items.length - miss.length;
+  box.innerHTML = !items.length ? '<div class="msg">Discogs har inga album listade för artisten.</div>' : `
+    <p class="note">${items.length} album och singlar där ${esc(name)} är huvudartist. Du har ${have}${hidden.size ? ' (dolda räknas som klara)' : ''}.</p>
+    ${miss.map(x => `<div class="cand">
+      ${x.thumb ? `<img src="${esc(x.thumb)}" alt="" loading="lazy">` : '<div class="ph">♪</div>'}
+      <div><div class="t">${esc(x.title)}</div><div class="m">${esc(x.year || '')}</div>
+        <div class="btns"><button data-mwant="${esc(x.id)}">Vill ha</button><button data-mhave="${esc(x.id)}">Har den</button><button data-mhide="${esc(x.id)}">Dölj</button></div></div></div>`).join('')
+      || '<div class="msg">Du har allt! 🎉</div>'}`;
+  box.onclick = e => {
+    const b = e.target.closest('button'); if (!b) return;
+    const id = +(b.dataset.mwant || b.dataset.mhave || b.dataset.mhide);
+    const x = items.find(y => y.id === id); if (!x) return;
+    if (b.dataset.mhide) { hidden.add(id); LS.set('sh.missHide', [...hidden].slice(-2000)); drawMissing(name, items); return; }
+    const status = b.dataset.mwant ? 'want' : 'have';
+    const rec = { id: uid(), status, added: Date.now(), dType: 'master', dId: x.id, masterId: x.id, rid: x.main_release || undefined,
+      artist: name, title: x.title, year: parseInt(x.year) || null, cover: x.thumb || '', thumb: x.thumb || '', coverSmall: !!x.thumb, format: '', label: '', country: '', catno: '' };
+    recs.push(rec); saveRecs(); render(); matchSpotify(rec); setTimeout(resolveArtists, 1500);
+    toast(status === 'want' ? `${x.title} ligger på önskelistan` : `${x.title} ligger nu i hyllan`);
+    drawMissing(name, items);
+  };
+}
+
+/* ---------------- Foto eller backup som blev kvar när Android stängde appen ---------------- */
+// Om telefonen stängde appen medan kameran eller filväljaren var öppen tar skalet hand om resultatet
+// och lämnar över det här när appen startat igen (kräver Android-skal v4).
+let pendingBusy = false;
+async function checkPending() {
+  if (nativeVer() < 4 || pendingBusy) return;
+  pendingBusy = true;
+  try {
+    const p = JSON.parse(await native(id => App.takePending(id)) || '{}');
+    if (p.type === 'photo' && p.data) {
+      const bin = atob(p.data), bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      openAdd(addDefault);
+      toast('Fortsätter med fotot du tog');
+      onPhoto(new Blob([bytes], { type: 'image/jpeg' }));
+    } else if (p.type === 'save') {
+      driveSave('save');
+    } else if (p.type === 'load' && p.data) {
+      toast(mergeMsg(mergeBackup(JSON.parse(p.data))), 4000);
+    } else if (p.type === 'error') toast(p.data, 4000);
+  } catch (e) { console.log('pending', e); }
+  finally { pendingBusy = false; }
+}
+window.__checkPending = checkPending;
+
 /* ---------------- Bakåtknapp i appen ---------------- */
 window.__back = () => {
   if ($('#logSheet').classList.contains('open')) { closeLog(); return true; }
+  if (statsOpen()) { closeStats(); return true; }
   if ($('#settings').classList.contains('open')) { closeSettings(); return true; }
   if ($('#detail').classList.contains('open')) { closeDetail(); return true; }
   if ($('#addView').classList.contains('open')) { closeAdd(); return true; }
@@ -1381,7 +1997,9 @@ window.__back = () => {
   const p = new URLSearchParams(location.search);
   if (p.get('code') || p.get('error')) {
     history.replaceState(null, '', location.pathname);
-    if (p.get('code')) {
+    const expState = LS.get('sh.spstate', ''); LS.set('sh.spstate', '');
+    if (p.get('code') && (!expState || p.get('state') !== expState)) toast('Spotify-inloggningen kunde inte verifieras. Försök igen.', 5000);
+    else if (p.get('code')) {
       try {
         await spTokenCall({ grant_type: 'authorization_code', code: p.get('code'), redirect_uri: REDIRECT, code_verifier: LS.get('sh.pkce', '') });
         toast('Inloggad på Spotify');
@@ -1391,6 +2009,7 @@ window.__back = () => {
   }
   render();
   resolveArtists();
+  checkPending();
 })();
 </script>
 </body>

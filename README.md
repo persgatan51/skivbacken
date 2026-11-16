@@ -11,6 +11,12 @@ Samlingen sparas på telefonen. Under ⚙︎ → Backup till Google Drive sparar
 
 **Värde:** varje skiva visar Discogs prisförslag för valt skick (standard VG+) och lägsta pris just nu, och samlingens totala värde visas under flikarna. Prisförslagen kräver att säljarinställningarna är ifyllda på Discogs (välj SEK). Du kan välja exakt utgåva per skiva.
 
+**Prisbevakning:** på en skiva i Vill ha kan du skriva ett pris. Appen kollar Discogs varje dygn och säger till när någon säljer den billigare.
+
+**Statistik (📊):** decennier, genrer, skivbolag, artister, tillagda per månad, dyraste skivorna, värdeutveckling, utlånade skivor och fynd på önskelistan. Därifrån (och från varje skiva) kan du se vilka album av en artist du saknar.
+
+**Slumpa (🎲):** väljer en skiva bland de som syns, helst en du inte spelat på 60 dagar. **Låna ut:** skriv vem som har skivan, så syns det på omslaget.
+
 **Många skivor:** tryck på + och välj "Snabbskanna många skivor". Skanna streckkod efter streckkod. Säkra träffar läggs in direkt, och osäkra hamnar i "Att granska".
 
 ## Kom igång
