@@ -1,0 +1,26 @@
+name: Kontrollera webbappen
+
+# Körs vid varje push och PR. Hittar syntaxfel i index.html innan de märks i appen
+# (GitHub Pages publicerar main direkt).
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Syntaxkontroll av skriptet i index.html
+        run: |
+          node -e '
+            const s = require("fs").readFileSync("index.html", "utf8");
+            const m = [...s.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+            if (!m.length) { console.error("Hittade inget <script>"); process.exit(1); }
+            require("fs").writeFileSync("app.js", m.map(x => x[1]).join("\n;\n"));
+          '
+          node --check app.js
+          echo "Skriptet är syntaktiskt korrekt."
