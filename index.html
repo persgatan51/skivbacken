@@ -84,7 +84,9 @@
   .rec img{width:100%;height:100%;object-fit:cover;display:block;border-radius:3px;pointer-events:none;-webkit-user-drag:none}
   .rec.loading img{opacity:0}
   .rec img{transition:opacity .2s}
-  .rec::after{content:"";position:absolute;inset:0;border-radius:3px;background:#05060a;opacity:var(--sh,0);pointer-events:none}
+  /* Skuggan är ett eget element med eget grafiklager: att ändra dess opacitet när man bläddrar ska inte
+     tvinga webbläsaren att rita om (och avkoda) omslaget varje bildruta – det var det som fick omslagen att flimra. */
+  .rec .shade{position:absolute;inset:0;border-radius:3px;background:#05060a;opacity:0;pointer-events:none;will-change:opacity}
   .rec .sleeve{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:flex-end;padding:9%;
        background:linear-gradient(135deg,#2b303a,#1b1e25);border-radius:3px}
   .rec .sleeve b{font-size:calc(var(--s) * .085);line-height:1.1}
@@ -502,8 +504,11 @@ async function fetchPriceNow(r, bg) {
    (så att grafen ändå når fram till i dag), och samma dygn ersätter den senaste. Max 52 punkter. */
 function addHistPoint(h, pt) {
   const n = h.length, last = h[n - 1];
-  if (last && last.c === pt.c && last.v === pt.v && n >= 2 && h[n - 2].v === pt.v && h[n - 2].c === pt.c) last.t = pt.t;
-  else if (last && pt.t - last.t < DAY) h[n - 1] = pt;
+  // Är den senaste punkten slutet på en platå (samma värde som punkten före) får den inte skrivas över
+  // av ett nytt värde, då skulle grafen visa en jämn ökning i stället för ett hopp.
+  const plateauEnd = last && n >= 2 && h[n - 2].v === last.v && h[n - 2].c === last.c;
+  if (plateauEnd && last.c === pt.c && last.v === pt.v) last.t = pt.t;
+  else if (last && !plateauEnd && pt.t - last.t < DAY) h[n - 1] = pt;
   else h.push(pt);
   return h.slice(-52);
 }
@@ -769,12 +774,16 @@ function crateEl(i) {
     const img = new Image();
     img.alt = '';
     img.src = r.cover;
-    el.classList.add('loading');
-    img.decode().catch(() => {}).finally(() => el.classList.remove('loading'));
+    // Tona bara in omslag som inte redan finns i cachen; annars blinkar de när ett element skapas på nytt.
+    if (!img.complete) {
+      el.classList.add('loading');
+      img.decode().catch(() => {}).finally(() => el.classList.remove('loading'));
+    }
     el.appendChild(img);
   } else {
     el.innerHTML = `<div class="sleeve"><b>${esc(r.title)}</b><span>${esc(r.artist)}</span></div>`;
   }
+  el._shade = el.appendChild(document.createElement('i')); el._shade.className = 'shade';
   if (r.status === 'want' && view.tab === 'all') el.insertAdjacentHTML('beforeend', '<span class="wantTag">Vill ha</span>');
   if (r.loan) el.insertAdjacentHTML('beforeend', `<span class="loanTag">Utlånad till ${esc(r.loan.to)}</span>`);
   else if (isDeal(r)) el.insertAdjacentHTML('beforeend', '<span class="loanTag dealTag">Fynd</span>');
@@ -809,11 +818,13 @@ function crateDraw(force) {
       const t = Math.min(1, -d - 1); rx = -80 - t * 4; y = 0.02 * S; z = 0.07 * S + t * 0.02 * S; sh = 0.35 + t * 0.2; op = 1 - t;
     }
     el.hidden = false;
-    el.style.willChange = 'transform';   // bara de ~19 synliga får ett eget grafiklager
+    el.style.willChange = 'transform, opacity';   // bara de ~19 synliga får ett eget grafiklager
     el.style.visibility = op > 0.001 ? 'visible' : 'hidden';
     el.style.transform = `translate3d(0,${y.toFixed(1)}px,${z.toFixed(1)}px) rotateX(${rx.toFixed(2)}deg)`;
-    el.style.zIndex = String(Math.round(2000 - d * 10));
-    el.style.setProperty('--sh', sh.toFixed(3));
+    // Ordningen följer bara platsen i listan (lägre nummer ligger framför), så z-index behöver inte
+    // ändras varje bildruta. Backen (#stage) är en egen stapling, så värdet krockar inte med framkanten.
+    const zi = String(1000000 - i); if (el.style.zIndex !== zi) el.style.zIndex = zi;
+    el._shade.style.opacity = sh.toFixed(3);
     el.style.opacity = op.toFixed(3);
   }
   const cur = Math.round(pos);
@@ -1206,14 +1217,12 @@ $('#addResults').addEventListener('click', e => {
   }
   const b = e.target.closest('button[data-i]'); if (!b) return;
   const i = +b.dataset.i, c = lastCands[i];
-  const rec = { id: uid(), status: b.dataset.s, added: Date.now(), ...c };
-  recs.push(rec); saveRecs();
-  addedNow.set(i, rec.id); addSession.push(rec.id);
+  const rec = addRecFromCand(c, b.dataset.s);
+  addedNow.set(i, rec.id);
   render();
   showCands(lastCands);   // vyn är kvar öppen, så att man kan lägga till fler från samma sökning
   setTimeout(resolveArtists, 2000);
   toast(rec.status === 'have' ? `${rec.title} ligger nu i hyllan` : `${rec.title} ligger på önskelistan`);
-  matchSpotify(rec);
 });
 
 /* ---------------- Detaljvy ---------------- */
@@ -1503,8 +1512,13 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-17';
+const WEB_VERSION = '2026-11-18';
 const CHANGELOG = [
+  { d: '2026-11-18', t: 'Omslagen flimrar inte när du bläddrar', i: [
+    'Rättat: omslagen kunde flimra när du bläddrade i backen. Skuggningen ritade om alla synliga omslag varje bildruta; nu gör den inte det, och omslag som redan är laddade tonas inte in på nytt.',
+    'Rättat: "Hämta backup" kunde i ovanliga fall ge två skivor med samma id.',
+    'Rättat: värdegrafen kunde visa en jämn ökning i stället för ett hopp efter "Uppdatera pris".',
+    'Skivor som du lägger till från "Att granska" eller med snabbskanning räknas nu också i "Klar (n)".' ] },
   { d: '2026-11-17', t: 'Lägg till flera skivor från samma sökning', i: [
     'Ny: när du söker kan du lägga till flera skivor ur resultatet. Sökningen ligger kvar, och knappen "Klar" visar hur många du lagt till. Ångra finns direkt på raden.',
     'Rättat: priset i en skiva kunde snurra för evigt när Discogs sa "för många anrop". Nu visas meddelandet och en knapp för att försöka igen.',
@@ -1644,13 +1658,19 @@ function mergeBackup(data) {
   let added = 0, merged = 0;
   // Jämför bara mot skivorna som fanns här före importen, och varje lokal skiva högst en gång,
   // så att två exemplar i backupen inte slås ihop till ett.
-  const local = recs.slice(), used = new Set();
-  for (const raw of list) {
-    const r = cleanRec(raw); if (!r) continue;
-    if (deleted[r.id]) continue;
-    const x = local.find(y => y.id === r.id && !used.has(y)) || local.find(y => !used.has(y) && sameRec(y, r));
-    if (!x) { recs.push(r); added++; continue; }
-    used.add(x);
+  const local = recs.slice(), used = new Set(), byId = new Map(local.map(y => [y.id, y]));
+  const incoming = list.map(cleanRec).filter(r => r && !deleted[r.id]);
+  // Först samma id för hela backupen, sedan samma Discogs-post för resten. Annars kunde en annan post
+  // "ta" den lokala skivan först, och skivan med samma id lades till som en ny med ett id som redan fanns.
+  const match = new Map();
+  for (const r of incoming) { const x = byId.get(r.id); if (x && !used.has(x)) { used.add(x); match.set(r, x); } }
+  for (const r of incoming) {
+    let x = match.get(r);
+    if (!x) { x = local.find(y => !used.has(y) && sameRec(y, r)); if (x) used.add(x); }
+    if (!x) {
+      if (recs.some(y => y.id === r.id)) r.id = uid();   // två skivor får aldrig ha samma id
+      recs.push(r); added++; continue;
+    }
     merged++;
     for (const k of FILL_KEYS) { const v = r[k]; if (v != null && v !== '' && (x[k] == null || x[k] === '')) x[k] = v; }
     if (r.lastPlayed > (x.lastPlayed || 0)) x.lastPlayed = r.lastPlayed;
@@ -1747,6 +1767,9 @@ function addRecFromCand(c, status) {
   const rec = { id: uid(), status, added: Date.now(), ...c };
   delete rec.score;
   recs.push(rec); saveRecs();
+  // Alla skivor som läggs till medan Lägg till-vyn är öppen (sökning, kön, snabbskanning) räknas i
+  // "Klar (n)" och visas i backen när vyn stängs.
+  if ($('#addView').classList.contains('open')) { addSession.push(rec.id); updateAddDone(); }
   matchSpotify(rec);
   return rec;
 }
