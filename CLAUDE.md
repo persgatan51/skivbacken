@@ -1,6 +1,7 @@
 # Skivbacken – anteckningar för Claude
 
 - Ägare: Fredrik (persgatan51). Svara och skriv på svenska.
+- **Inga pull requests.** Fredrik är ensam utvecklare: committa och pusha direkt till `main` när ändringen är klar och kontrollerad (GitHub Pages publicerar då direkt).
 - Webbappen är en enda fil, `index.html`, som körs från GitHub Pages: https://persgatan51.github.io/skivbacken/
 - `android/` är ett tunt WebView-skal (Kotlin). GitHub Actions bygger APK:n när något under `android/` ändras och lägger den i releasen `app`.
 - Behåll `applicationId = se.persgatan.skivhyllan`, annars installeras inte uppdateringar ovanpå den gamla appen och användarens data försvinner.
