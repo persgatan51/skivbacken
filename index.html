@@ -214,6 +214,10 @@
     <input id="aq" type="search" enterkeyhint="search" autocomplete="off" placeholder="Sök artist eller album">
     <button id="closeAdd">Stäng</button>
   </div>
+  <div class="filters" id="aFilters">
+    <select id="aFmt" aria-label="Format"><option value="vinyl">Bara vinyl</option><option value="">Alla format</option></select>
+    <select id="aYear" aria-label="Utgiven från"></select>
+  </div>
   <div class="shoot">
     <label class="big">📷 Fota skivan<input id="camInput" type="file" accept="image/*" capture="environment"></label>
     <label>🖼 Välj bild<input id="picInput" type="file" accept="image/*"></label>
@@ -1019,6 +1023,8 @@ async function dg(path, params = {}, opt = {}) {
   try { return await r.json(); } catch { const e = new Error('Konstigt svar från Discogs. Kolla nätet.'); e.net = true; throw e; }
 }
 const dgSearch = p => dg('/database/search', { per_page: 10, ...p }).then(j => j.results || []);
+// Formatfilter för textsökningar (inte streckkod, den ger alltid exakt utgåva). Standard: bara vinyl.
+const fmtP = () => cfg.aFmt === '' ? {} : { format: 'Vinyl' };
 
 function splitTitle(t) {
   const i = (t || '').indexOf(' - ');
@@ -1117,7 +1123,7 @@ async function findFromInfo(info) {
   const q = [info.artist, info.title].filter(Boolean).join(' ');
   if (q) tries.push({ q, type: 'master' }, { q, type: 'release' });
   for (const p of tries) {
-    const res = await dgSearch(p);
+    const res = await dgSearch({ ...fmtP(), ...p });
     if (res.length) return res.map(toCand);
   }
   return [];
@@ -1141,7 +1147,7 @@ async function findFromScan(scan) {
   // 2. Katalognummer, t.ex. "SKL 5251".
   const lines = (scan.lines || []).filter(l => norm(l.t).length > 1);
   const cat = lines.map(l => l.t.match(CATNO)).find(Boolean);
-  if (cat) add(await dgSearch({ catno: cat[1], type: 'release' }), 0.3);
+  if (cat) add(await dgSearch({ catno: cat[1], type: 'release', ...fmtP() }), 0.3);
   // 3. Den största texten är oftast artist och titel.
   const big = byHeight(lines).slice(0, 3).map(l => l.t);
   const qs = [];
@@ -1150,16 +1156,48 @@ async function findFromScan(scan) {
   if (big.length) qs.push(big[0]);
   for (const q of qs.slice(0, 3)) {
     if (best() >= 0.99) break;
-    add(await dgSearch({ q, type: 'master', per_page: 8 }));
+    add(await dgSearch({ q, type: 'master', per_page: 8, ...fmtP() }));
   }
-  if (best() < 0.5 && qs[0]) add(await dgSearch({ q: qs[0], type: 'release', per_page: 8 }));
+  if (best() < 0.5 && qs[0]) add(await dgSearch({ q: qs[0], type: 'release', per_page: 8, ...fmtP() }));
   return rank(seen);
 }
 const rank = m => [...m.values()].sort((a, b) => b.score - a.score).slice(0, 8);
+/* Textsökning med format- och årsfilter. Hämtar 50 åt gången och kan hämta fler ("Visa fler").
+   Årsfiltret görs här i appen (Discogs kan inte filtrera på "från år"), därför hämtas fler sidor
+   tills det finns tillräckligt många träffar efter filtret. */
+let textSearch = null;   // { q, type, page, pages, total } för sökningen som visas nu
+const minYear = () => parseInt(cfg.aYear) || 0;
+const yearOk = c => !minYear() || (c.year && c.year >= minYear());
+async function textPage(st) {
+  const j = await dg('/database/search', { q: st.q, type: st.type, per_page: 50, page: st.page, ...fmtP() });
+  st.pages = j.pagination?.pages || 1;
+  st.total = j.pagination?.items || 0;
+  return (j.results || []).map(toCand);
+}
 async function findFromText(q) {
-  let res = await dgSearch({ q, type: 'master' });
-  if (res.length < 3) res = res.concat(await dgSearch({ q, type: 'release', per_page: 8 }));
-  return res.map(toCand);
+  const st = textSearch = { q, type: 'master', page: 1 };
+  let res = await textPage(st);
+  // Få album (master): visa specifika utgåvor i stället.
+  if (res.length < 3) {
+    const st2 = { q, type: 'release', page: 1 };
+    const rel = await textPage(st2);
+    if (rel.length > res.length) { textSearch = st2; res = res.concat(rel); }
+  }
+  return fillYear(textSearch, res);
+}
+async function moreFromText() {
+  const st = textSearch; if (!st || st.page >= st.pages) return [];
+  st.page++;
+  return fillYear(st, await textPage(st));
+}
+// Med årsfilter: hämta fler sidor (högst 4 extra) tills minst 15 träffar klarar filtret.
+async function fillYear(st, res) {
+  let ok = res.filter(yearOk), extra = 0;
+  while (minYear() && ok.length < 15 && st.page < st.pages && extra < 4) {
+    st.page++; extra++;
+    ok = ok.concat((await textPage(st)).filter(yearOk));
+  }
+  return ok;
 }
 
 /* ---------------- Lägg till ---------------- */
@@ -1170,7 +1208,7 @@ let addedNow = new Map();
 let addSession = [];   // id för alla skivor som lagts till sedan vyn öppnades (även från tidigare sökningar)
 let pendingQueueId = null;   // köposten man tryckt "Sök med text" på
 function openAdd(def = 'have') {
-  addDefault = def; pendingQueueId = null;
+  addDefault = def; pendingQueueId = null; textSearch = null; syncAddFilters();
   addedNow = new Map(); addSession = []; updateAddDone();
   $('#addView').classList.add('open');
   $('#addStatus').innerHTML = `<p class="note">Bäst träff: fota baksidan så att streckkoden syns. Saknas streckkod frågar appen Gemini om omslaget${cfg.gemini ? ` (${gemCount()} anrop idag)` : ''}.</p>`;
@@ -1249,15 +1287,41 @@ $('#aq').addEventListener('keydown', async e => {
   if (e.key !== 'Enter') return;
   const q = e.target.value.trim(); if (!q) return;
   e.target.blur();
-  try { busy('Söker…'); $('#addResults').innerHTML = ''; const c = await findFromText(q); $('#addStatus').innerHTML = ''; showCands(c); }
-  catch (err) { fail(err); }
+  runText(q);
 });
+async function runText(q) {
+  try { busy('Söker…'); $('#addResults').innerHTML = ''; const c = await findFromText(q); $('#addStatus').innerHTML = ''; showCands(c, true); }
+  catch (err) { fail(err); }
+}
+// Filtren i Lägg till: sparas, och gör om textsökningen om en sådan visas.
+const YEARS = [0, 1960, 1970, 1980, 1990, 2000, 2010, 2020];
+$('#aYear').innerHTML = YEARS.map(y => `<option value="${y || ''}">${y ? 'Från ' + y : 'Alla år'}</option>`).join('');
+function syncAddFilters() {
+  $('#aFmt').value = cfg.aFmt === '' ? '' : 'vinyl';
+  $('#aYear').value = cfg.aYear ? String(cfg.aYear) : '';
+  $('#aFmt').classList.toggle('on', cfg.aFmt !== '');
+  $('#aYear').classList.toggle('on', !!minYear());
+}
+syncAddFilters();
+const onAddFilter = () => {
+  cfg.aFmt = $('#aFmt').value; cfg.aYear = $('#aYear').value; saveCfg(); syncAddFilters();
+  if (textSearch) runText(textSearch.q);
+};
+$('#aFmt').onchange = onAddFilter;
+$('#aYear').onchange = onAddFilter;
 
-function showCands(cands) {
-  if (cands !== lastCands) addedNow = new Map();
+function showCands(cands, fromText = false) {
+  if (cands !== lastCands) { addedNow = new Map(); if (!fromText && cands !== lastCands) textSearch = null; }
   lastCands = cands;
   updateAddDone();
-  if (!cands.length) { $('#addResults').innerHTML = '<div class="msg">Ingen träff i Discogs. Prova att skriva artist och album i sökfältet.</div>'; return; }
+  const st = textSearch;
+  const more = st && st.page < st.pages
+    ? `<div class="actions" style="margin:10px 0"><button id="aMore">Visa fler</button></div>` : '';
+  const filt = [cfg.aFmt !== '' ? 'bara vinyl' : '', minYear() ? 'från ' + minYear() : ''].filter(Boolean).join(', ');
+  if (!cands.length) {
+    $('#addResults').innerHTML = `<div class="msg">Ingen träff i Discogs${filt ? ` (${filt})` : ''}. ${filt ? 'Prova att ändra filtret ovanför, eller' : 'Prova att'} skriva artist och album i sökfältet.</div>` + more;
+    return;
+  }
   $('#addResults').innerHTML = cands.map((c, i) => {
     const mine = addedNow.has(i) && recs.find(r => r.id === addedNow.get(i));
     const ex = !mine && findExisting(c);
@@ -1270,9 +1334,19 @@ function showCands(cands) {
           <button data-i="${i}" data-s="have" class="${addDefault === 'have' ? 'on' : ''}">Har den</button>
           <button data-i="${i}" data-s="want" class="${addDefault === 'want' ? 'on' : ''}">Vill ha</button>`}</div>
       </div></div>`;
-  }).join('') + '<p class="note">Listan kommer från Discogs. "Master" är albumet i allmänhet, övriga rader är specifika utgåvor.</p>';
+  }).join('') + more + `<p class="note">${st ? `Visar ${cands.length}${filt ? ` (${filt})` : ''} av ${st.total} träffar i Discogs. ` : ''}Listan kommer från Discogs. "Master" är albumet i allmänhet, övriga rader är specifika utgåvor.</p>`;
 }
-$('#addResults').addEventListener('click', e => {
+$('#addResults').addEventListener('click', async e => {
+  if (e.target.id === 'aMore') {
+    const b = e.target; b.disabled = true; b.innerHTML = '<span class="spin"></span>Hämtar…';
+    try {
+      const seen = new Set(lastCands.map(c => c.dType + c.dId));
+      const add = (await moreFromText()).filter(c => !seen.has(c.dType + c.dId));
+      lastCands.push(...add); showCands(lastCands, true);
+      if (!add.length) toast('Inga fler träffar som passar filtret');
+    } catch (err) { b.disabled = false; b.textContent = 'Visa fler'; toast(err.message); }
+    return;
+  }
   const u = e.target.closest('button[data-undo]');
   if (u) {
     // Ångra: ta bort skivan som just lades till.
@@ -1590,8 +1664,14 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-19';
+const WEB_VERSION = '2026-11-19b';
 const CHANGELOG = [
+  { d: '2026-11-19', t: 'Filter när du söker fram skivor', i: [
+    'Ny: när du lägger till skivor visas bara vinyl som standard. Välj "Alla format" om du vill se CD, kassett m.m.',
+    'Ny: filtrera bort äldre skivor med "Från år" (t.ex. från 1990). Valen sparas till nästa gång.',
+    'Ny: sökningen visar 50 träffar i stället för 10, och knappen "Visa fler" hämtar resten. Bra för artister med många album.',
+    'Fotade skivor utan streckkod söks också bara bland vinyl när "Bara vinyl" är valt.',
+  ] },
   { d: '2026-11-19', t: 'Sök på låt, filter i backen och dela önskelistan', i: [
     'Ny: sök på en låttitel. Skivor där låten finns visas, med låten under titeln.',
     'Ny: filter för decennium, genre och skivbolag under 🔍. 🎲 slumpar bara bland skivorna som syns.',
@@ -1768,7 +1848,7 @@ function mergeBackup(data) {
     if (sameRel && r.priceHist?.length) x.priceHist = compactHist([...(x.priceHist || []), ...r.priceHist].sort((a, b) => a.t - b.t));
   }
   // Inställningar: bara kända fält, och bara de som saknas här.
-  const CFG_KEYS = ['discogs', 'gemini', 'spClient', 'cond', 'bkAuto', 'geminiModel'];
+  const CFG_KEYS = ['discogs', 'gemini', 'spClient', 'cond', 'bkAuto', 'geminiModel', 'aFmt', 'aYear'];
   if (data.cfg && typeof data.cfg === 'object')
     for (const k of CFG_KEYS) { const v = data.cfg[k]; if (v && !cfg[k] && (typeof v === 'string' || typeof v === 'boolean')) cfg[k] = v; }
   if (data.artistInfo && typeof data.artistInfo === 'object')
