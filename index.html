@@ -21,6 +21,10 @@
   textarea{min-height:120px;font-size:12px;font-family:ui-monospace,monospace}
   .tools{margin-top:10px}
   .tools select{width:auto;padding:8px}
+  .filters{display:flex;gap:6px;margin-top:6px}
+  .filters select{flex:1;min-width:0;font-size:13px;padding:6px}
+  .filters select.on{border-color:var(--acc);color:var(--acc)}
+  .bars.click [data-fk]{cursor:pointer}
   .tabs{display:flex;gap:6px;margin-top:10px}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(105px,1fr));gap:12px}
   .item{background:none;border:0;border-radius:10px;padding:0;text-align:left}
@@ -177,7 +181,12 @@
   </div>
   <div id="worth"></div>
   <div class="tools" id="searchRow" hidden>
-    <input id="filter" type="search" placeholder="Sök artist eller album i hyllan" autocomplete="off">
+    <input id="filter" type="search" placeholder="Sök artist, album eller låt" autocomplete="off">
+    <div class="filters">
+      <select id="fDec" aria-label="Decennium"></select>
+      <select id="fGenre" aria-label="Genre"></select>
+      <select id="fLabel" aria-label="Skivbolag"></select>
+    </div>
   </div>
 </header>
 
@@ -278,7 +287,7 @@ const REDIRECT = location.origin + location.pathname;
 let cfg = LS.get('sh.cfg', {});
 let sp = LS.get('sh.sp', null);           // Spotify-token
 let recs = LS.get('sh.recs', []);          // skivorna
-let view = { tab: 'have', q: '' };
+let view = { tab: 'have', q: '', f: { dec: '', genre: '', label: '' } };
 let addDefault = 'have';
 
 let deleted = LS.get('sh.deleted', {});   // { id: tidpunkt } för borttagna skivor och köposter, så att en backup inte väcker dem igen
@@ -472,6 +481,7 @@ function fetchPrice(r, bg) {
   return p;
 }
 async function fetchPriceNow(r, bg) {
+  const wasDeal = isDeal(r);
   const rid = await releaseIdOf(r, bg);
   let sug = null;
   try {
@@ -498,7 +508,8 @@ async function fetchPriceNow(r, bg) {
     toast(`Fynd: ${r.title} finns för ${money(r.price.low.v, 'SEK')} på Discogs`, 6000);
   }
   saveRecs({ bg: true });
-  scheduleRender(false);
+  // Inte längre ett fynd (priset gick upp): ta bort märket i backen och rutnätet.
+  scheduleRender(wasDeal && !isDeal(r));
 }
 /* Lägger till en punkt i en skivas värdehistorik. Oförändrat värde förlänger bara den senaste punkten
    (så att grafen ändå når fram till i dag), och samma dygn ersätter den senaste. Max 52 punkter. */
@@ -536,8 +547,10 @@ function updateWorth() { const w = worthLine(); $('#worth').innerHTML = w; $('#w
 function worthLine() {
   if (view.tab === 'want') {
     const deals = recs.filter(isDeal).length, watched = recs.filter(r => r.status === 'want' && r.watch).length;
-    if (deals) return `<a href="#" data-act="deals"><b>${deals} fynd</b> under din prisgräns just nu</a>`;
-    return watched ? `${watched} skivor bevakas · inga under din gräns just nu` : '';
+    const share = recs.some(r => r.status === 'want') ? '<a href="#" data-act="share">Dela önskelistan</a>' : '';
+    const info = deals ? `<a href="#" data-act="deals"><b>${deals} fynd</b> under din prisgräns just nu</a>`
+      : watched ? `${watched} skivor bevakas · inga under din gräns just nu` : '';
+    return [info, share].filter(Boolean).join(' · ');
   }
   const have = recs.filter(r => r.status === 'have');
   if (!have.length) return '';
@@ -606,7 +619,7 @@ function drawValue(r) {
     const n = Math.round(+$('#dWatch').value);
     if (n > 0) { r.watch = n; delete r.dealSeen; toast(`Bevakas: säger till under ${money(n, 'SEK')}`); }
     else { delete r.watch; toast('Bevakningen borttagen'); }
-    saveRecs(); drawValue(r); updateWorth();
+    saveRecs(); drawValue(r); render();   // render: märket "Fynd" i backen följer bevakningen
   };
   if ($('#dSell')) $('#dSell').onclick = () => openUrl(sellUrl(r));
 }
@@ -667,10 +680,52 @@ async function showVersions(r, masterId) {
 view.mode = LS.get('sh.mode', 'crate');
 
 let gridSig = '';
-// Skivorna som syns just nu: vald flik och sökning, sorterade.
+// Filter: decennium, genre och skivbolag (samma indelning som i statistiken).
+const decOf = r => r.year ? Math.floor(r.year / 10) * 10 + '-tal' : '';
+const labelOf = r => (r.label || '').replace(/\s*\(\d+\)$/, '');
+const filterOn = () => !!(view.f.dec || view.f.genre || view.f.label);
+const passFilter = r => (!view.f.dec || decOf(r) === view.f.dec) && (!view.f.genre || (r.genre || []).includes(view.f.genre))
+  && (!view.f.label || labelOf(r) === view.f.label);
+// Första låten på skivan vars titel innehåller sökningen (minst 3 tecken), för "Sök på låt".
+function trackHit(r, q) {
+  if (!q || q.length < 3 || !r.tracks) return null;
+  const t = r.tracks.find(t => !t.h && t.t && norm(t.t).includes(q));
+  return t ? (t.p ? t.p + ' ' : '') + t.t : null;
+}
+// Skivorna som syns just nu: vald flik, sökning och filter, sorterade.
 function visibleList() {
   const q = norm(view.q);
-  return sortRecs(recs.filter(r => (view.tab === 'all' || r.status === view.tab) && (!q || norm(r.artist + ' ' + r.title + ' ' + (r.loan?.to || '')).includes(q))));
+  return sortRecs(recs.filter(r => (view.tab === 'all' || r.status === view.tab) && passFilter(r)
+    && (!q || norm(r.artist + ' ' + r.title + ' ' + (r.loan?.to || '')).includes(q) || trackHit(r, q))));
+}
+// Låten som gav träff, om skivan bara hittades via låtlistan.
+function songMatch(r) {
+  const q = norm(view.q);
+  if (!q || norm(r.artist + ' ' + r.title + ' ' + (r.loan?.to || '')).includes(q)) return null;
+  return trackHit(r, q);
+}
+// Fyller i filterlistorna utifrån skivorna i vald flik (med antal), och markerar de som är valda.
+function fillFilters() {
+  const base = recs.filter(r => view.tab === 'all' || r.status === view.tab);
+  const opts = (el, all, entries, val) => {
+    if (val && !entries.some(e => e[0] === val)) entries.unshift([val, 0]);
+    el.innerHTML = `<option value="">${all}</option>` + entries.map(([k, n]) =>
+      `<option value="${esc(k)}"${k === val ? ' selected' : ''}>${esc(k)}${n ? ` (${n})` : ''}</option>`).join('');
+    el.classList.toggle('on', !!val);
+  };
+  opts($('#fDec'), 'Alla decennier', countBy(base, decOf).sort((a, b) => a[0].localeCompare(b[0])), view.f.dec);
+  opts($('#fGenre'), 'Alla genrer', countBy(base, r => r.genre), view.f.genre);
+  opts($('#fLabel'), 'Alla skivbolag', countBy(base, labelOf).slice(0, 60), view.f.label);
+}
+for (const [id, k] of [['#fDec', 'dec'], ['#fGenre', 'genre'], ['#fLabel', 'label']])
+  $(id).onchange = e => { view.f[k] = e.target.value; render(); };
+// Öppnar backen med ett filter (t.ex. från en stapel i statistiken).
+function showFiltered(k, v) {
+  view.f = { dec: '', genre: '', label: '', [k]: v };
+  if (view.tab === 'want') view.tab = 'have';
+  $('#searchRow').hidden = false;
+  crate.pos = 0; crate.target = null;
+  render(); crateLayout(); scrollTo(0, 0);
 }
 function render() {
   const have = recs.filter(r => r.status === 'have').length;
@@ -685,14 +740,15 @@ function render() {
   $('#gridView').hidden = view.mode === 'crate';
 
   const q = view.q.trim();
+  if (!$('#searchRow').hidden) fillFilters();
   const list = visibleList();
   const emptyMsg = !recs.length
     ? `Backen är tom.<br>Tryck på <b>+</b> för att fota en skiva eller söka fram en.${!cfg.discogs ? '<br><br>Börja med att lägga in nycklarna under ⚙︎.' : ''}`
-    : !list.length ? (q ? 'Inga träffar.' : view.tab === 'want' ? 'Önskelistan är tom.' : 'Inga skivor här än.') : '';
+    : !list.length ? (q || filterOn() ? 'Inga träffar.' : view.tab === 'want' ? 'Önskelistan är tom.' : 'Inga skivor här än.') : '';
 
   if (view.mode === 'crate') { gridSig = ''; crateSet(list, emptyMsg); return; }
   // Rutnätet byggs bara om när något som syns har ändrats (inte när ett pris kommer in i bakgrunden).
-  const sig = view.tab + '\n' + emptyMsg + '\n' + list.map(r => [r.id, r.cover, r.title, r.artist, r.year, r.loan?.to, isDeal(r)].join('|')).join('\n');
+  const sig = view.tab + '\n' + emptyMsg + '\n' + list.map(r => [r.id, r.cover, r.title, r.artist, r.year, r.loan?.to, isDeal(r), songMatch(r)].join('|')).join('\n');
   if (sig === gridSig) return;
   gridSig = sig;
   if (emptyMsg) { $('#list').innerHTML = `<div class="msg">${emptyMsg}</div>`; return; }
@@ -701,6 +757,7 @@ function render() {
       ${r.cover ? `<img class="cover" loading="lazy" decoding="async" src="${esc(r.cover)}" alt="">` : '<div class="ph">♪</div>'}
       <div class="t">${esc(r.title)}</div>
       <div class="m">${esc(r.artist)}${r.year ? ' · ' + esc(r.year) : ''}</div>
+      ${songMatch(r) ? `<div class="m" style="color:var(--acc)">♪ ${esc(songMatch(r))}</div>` : ''}
       ${r.loan ? `<div class="m">Utlånad till ${esc(r.loan.to)}</div>` : ''}${isDeal(r) ? '<div class="m" style="color:var(--sp)">Fynd!</div>' : ''}
     </button>`).join('') + '</div>';
 }
@@ -709,7 +766,8 @@ document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { view.ta
 $('#filter').oninput = e => { view.q = e.target.value; render(); };
 $('#btnSearch').onclick = () => {
   const row = $('#searchRow'); row.hidden = !row.hidden;
-  if (row.hidden) { $('#filter').value = ''; view.q = ''; render(); } else $('#filter').focus();
+  if (row.hidden) { $('#filter').value = ''; view.q = ''; view.f = { dec: '', genre: '', label: '' }; render(); }
+  else { fillFilters(); $('#filter').focus(); }
   crateLayout();
 };
 $('#btnView').onclick = () => { view.mode = view.mode === 'crate' ? 'grid' : 'crate'; LS.set('sh.mode', view.mode); render(); crateLayout(); };
@@ -747,9 +805,11 @@ function crateSet(list, emptyMsg) {
   crate.list = list;
   crate.idx = new Map(list.map((r, i) => [r.id, i]));
   $('#crateEmpty').innerHTML = emptyMsg || '';
+  // Element vars märken (Vill ha, Fynd, Utlånad) inte längre stämmer byggs om, även om listan är densamma.
+  const byId = new Map(list.map(r => [r.id, r]));
+  crate.els.forEach((el, id) => { const r = byId.get(id); if (r && el.dataset.tags !== tagKey(r)) { el.remove(); crate.els.delete(id); } });
   if (!same) {
     // Ta bort element för skivor som inte längre finns i listan eller har fått nytt omslag.
-    const byId = new Map(list.map(r => [r.id, r]));
     crate.els.forEach((el, id) => { const r = byId.get(id); if (!r || (r.cover || '') !== el.dataset.cover) { el.remove(); crate.els.delete(id); } });
     const keep = curId ? list.findIndex(r => r.id === curId) : -1;
     crate.pos = keep >= 0 ? keep : clampPos(Math.round(crate.pos)) || 0;
@@ -763,6 +823,8 @@ function crateSet(list, emptyMsg) {
   crate.shown = -1;
   crateLayout();
 }
+// Det som avgör vilka märken ett omslag har i backen.
+const tagKey = r => [r.status === 'want' && view.tab === 'all', r.loan?.to || '', !r.loan && isDeal(r)].join('|');
 function crateEl(i) {
   const r = crate.list[i];
   let el = crate.els.get(r.id);
@@ -770,6 +832,7 @@ function crateEl(i) {
   el = document.createElement('div');
   el.className = 'rec';
   el.dataset.cover = r.cover || '';
+  el.dataset.tags = tagKey(r);
   if (r.cover) {
     const img = new Image();
     img.alt = '';
@@ -835,7 +898,9 @@ function updateNow() {
   $('#now').style.visibility = r ? 'visible' : 'hidden';
   if (!r) { $('#curLetter').textContent = ''; return; }
   $('#nTitle').textContent = r.title;
-  $('#nArtist').textContent = r.artist + (r.year ? ' · ' + r.year : '') + (r.status === 'want' && view.tab === 'all' ? ' · Vill ha' : '') + (r.loan ? ' · utlånad till ' + r.loan.to : '');
+  const song = songMatch(r);
+  $('#nArtist').textContent = r.artist + (r.year ? ' · ' + r.year : '') + (r.status === 'want' && view.tab === 'all' ? ' · Vill ha' : '') + (r.loan ? ' · utlånad till ' + r.loan.to : '')
+    + (song ? ' · ♪ ' + song : '');
   $('#nCount').textContent = `${Math.round(crate.pos) + 1} av ${crate.list.length}` + (LS.get('sh.flipped', false) ? '' : ' · dra nedåt för att bläddra');
   const L = letterOf(r);
   $('#curLetter').textContent = L;
@@ -1103,8 +1168,9 @@ let lastCands = [];
 // Man kan lägga till flera i rad; vyn stängs först när man trycker Klar/Stäng.
 let addedNow = new Map();
 let addSession = [];   // id för alla skivor som lagts till sedan vyn öppnades (även från tidigare sökningar)
+let pendingQueueId = null;   // köposten man tryckt "Sök med text" på
 function openAdd(def = 'have') {
-  addDefault = def;
+  addDefault = def; pendingQueueId = null;
   addedNow = new Map(); addSession = []; updateAddDone();
   $('#addView').classList.add('open');
   $('#addStatus').innerHTML = `<p class="note">Bäst träff: fota baksidan så att streckkoden syns. Saknas streckkod frågar appen Gemini om omslaget${cfg.gemini ? ` (${gemCount()} anrop idag)` : ''}.</p>`;
@@ -1114,7 +1180,7 @@ function openAdd(def = 'have') {
   $('#btnBatch').hidden = !(window.App && App.scan);
 }
 function closeAdd() {
-  $('#addView').classList.remove('open');
+  $('#addView').classList.remove('open'); pendingQueueId = null;
   // Visa den senast tillagda skivan i backen.
   const ids = addSession.filter(id => recs.some(r => r.id === id));
   addedNow = new Map(); addSession = []; updateAddDone();
@@ -1194,7 +1260,7 @@ function showCands(cands) {
   if (!cands.length) { $('#addResults').innerHTML = '<div class="msg">Ingen träff i Discogs. Prova att skriva artist och album i sökfältet.</div>'; return; }
   $('#addResults').innerHTML = cands.map((c, i) => {
     const mine = addedNow.has(i) && recs.find(r => r.id === addedNow.get(i));
-    const ex = !mine && recs.find(r => r.dId === c.dId || (c.masterId && r.masterId === c.masterId));
+    const ex = !mine && findExisting(c);
     const meta = [c.year, c.format, c.label, c.country].filter(Boolean).join(' · ');
     return `<div class="cand">
       ${c.thumb ? `<img src="${esc(c.thumb)}" alt="">` : '<div class="ph">♪</div>'}
@@ -1384,27 +1450,37 @@ async function spAccess() {
   }
 }
 // fg: användaren väntar (t.ex. tryckt på en låt) – vänta inte på Spotify vid 429 utan ge upp direkt.
+// Returnerar null bara om man inte är inloggad. Går det inte att nå Spotify (inget nät, token gick inte
+// att förnya) kastas ett fel med e.net, så att det inte tolkas som "ingen träff".
+const spNetErr = () => { const e = new Error('Ingen kontakt med Spotify. Kolla nätet.'); e.net = true; return e; };
 async function spGet(path, opt = {}) {
   for (let attempt = 0; ; attempt++) {
-    const tok = await spAccess(); if (!tok) return null;
-    const r = await fetch('https://api.spotify.com/v1' + path, { headers: { Authorization: 'Bearer ' + tok } });
-    if (r.status === 401) { if (sp) sp.exp = 0; if (attempt) return null; continue; }
+    const tok = await spAccess();
+    if (!tok) { if (!sp) return null; throw spNetErr(); }
+    let r;
+    try { r = await fetch('https://api.spotify.com/v1' + path, { headers: { Authorization: 'Bearer ' + tok } }); }
+    catch { throw spNetErr(); }
+    if (r.status === 401) { if (sp) sp.exp = 0; if (attempt) throw spNetErr(); continue; }
     // För många anrop: vänta så länge Spotify säger (Retry-After) och försök igen.
     if (r.status === 429 && !opt.fg && attempt < 3) { await sleepMs(Math.min(60, +r.headers.get('Retry-After') || 5) * 1000 + 500); continue; }
     if (!r.ok) { const e = new Error('Spotify ' + r.status); e.status = r.status; throw e; }
     return r.json();
   }
 }
+// null = inte inloggad (då ska skivan inte räknas som provad).
 async function spAlbums(r) {
   let j = await spGet('/search?type=album&limit=10&q=' + encodeURIComponent(`album:${r.title} artist:${r.artist}`));
-  let items = j?.albums?.items || [];
-  if (!items.length) { j = await spGet('/search?type=album&limit=10&q=' + encodeURIComponent(`${r.artist} ${r.title}`)); items = j?.albums?.items || []; }
+  if (!j) return null;
+  let items = j.albums?.items || [];
+  if (!items.length) { j = await spGet('/search?type=album&limit=10&q=' + encodeURIComponent(`${r.artist} ${r.title}`)); if (!j) return null; items = j.albums?.items || []; }
   return items;
 }
+// Returnerar 'net' om Spotify inte gick att nå, så att matchAll kan pausa i stället för att gå igenom alla skivor.
 async function matchSpotify(r) {
   if (!sp) return;
   try {
     const items = await spAlbums(r);
+    if (!items) return;
     const t = norm(r.title), a = norm(r.artist);
     const best = items.find(x => norm(x.name) === t && x.artists.some(y => norm(y.name) === a))
       || items.find(x => norm(x.name).includes(t) && x.artists.some(y => norm(y.name).includes(a) || a.includes(norm(y.name))))
@@ -1413,7 +1489,7 @@ async function matchSpotify(r) {
     else r.spTried = Date.now();
     saveRecs({ bg: true });
     if (cur === r) { const el = $('#dSp'); if (el) el.textContent = r.spotifyName ? 'Spotify: ' + r.spotifyName : ''; }
-  } catch {}
+  } catch (e) { if (e.net) return 'net'; }
 }
 function markPlayed(r) { r.lastPlayed = Date.now(); saveRecs({ bg: true }); }
 function playAlbum(r) {
@@ -1440,6 +1516,7 @@ async function showAlts() {
   const box = $('#dAlts'); box.innerHTML = '<div class="msg"><span class="spin"></span>Söker i Spotify…</div>';
   try {
     const items = await spAlbums(cur);
+    if (!items) { box.innerHTML = '<div class="msg">Logga in på Spotify under ⚙︎ först.</div>'; return; }
     if (!items.length) { box.innerHTML = '<div class="msg">Inga album hittades.</div>'; return; }
     box.innerHTML = items.map((x, i) => `<div class="cand" data-i="${i}" style="cursor:pointer">
       ${x.images?.length ? `<img src="${esc(x.images[x.images.length - 1].url)}" alt="">` : '<div class="ph">♪</div>'}
@@ -1464,7 +1541,8 @@ async function matchAll() {
       if (!recs.includes(r) || r.spotifyId) continue;
       // Pausa medan en skiva är öppen, så att Spotify-kvoten räcker till det du gör just då.
       while (sp && $('#detail').classList.contains('open')) await sleepMs(3000);
-      await matchSpotify(r);
+      // Inget nät: sluta här. matchAll körs igen när bakgrundsjobbet är klart (t.ex. när nätet är tillbaka).
+      if ((await matchSpotify(r)) === 'net') break;
       await sleepMs(400);
     }
   } finally { spMatching = false; persistRecs(); }
@@ -1512,8 +1590,18 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-18';
+const WEB_VERSION = '2026-11-19';
 const CHANGELOG = [
+  { d: '2026-11-19', t: 'Sök på låt, filter i backen och dela önskelistan', i: [
+    'Ny: sök på en låttitel. Skivor där låten finns visas, med låten under titeln.',
+    'Ny: filter för decennium, genre och skivbolag under 🔍. 🎲 slumpar bara bland skivorna som syns.',
+    'Ny: tryck på en rad under Decennier, Genrer eller Skivbolag i 📊 för att se de skivorna i backen.',
+    'Ny: Dela önskelistan, från fliken Vill ha eller 📊. Med pris från Discogs, bra inför födelsedagar och jul.',
+    'Rättat: utan nät kunde alla skivor utan Spotify-album hoppas över i en vecka. Nu försöker appen igen när nätet är tillbaka.',
+    'Rättat: märkena "Vill ha" och "Fynd" på omslagen i backen stod kvar efter att du flyttat skivan eller slutat bevaka den.',
+    'Rättat: "Sök med text" i "Att granska" tog bort streckkoden innan du hunnit söka. Nu tas den bort först när du lagt till skivan.',
+    'Rättat: en skanning kunde i sällsynta fall räknas som "Fanns redan" fast skivan inte fanns.',
+    'Android-appen (v5): stängs inte längre om telefonen får ont om minne, utan laddar om sidan. Ingen vit skärm efter omstart. Kan dela önskelistan via telefonens dela-meny.' ] },
   { d: '2026-11-18', t: 'Omslagen flimrar inte när du bläddrar', i: [
     'Rättat: omslagen kunde flimra när du bläddrade i backen. Skuggningen ritade om alla synliga omslag varje bildruta; nu gör den inte det, och omslag som redan är laddade tonas inte in på nytt.',
     'Rättat: "Hämta backup" kunde i ovanliga fall ge två skivor med samma id.',
@@ -1770,6 +1858,12 @@ function addRecFromCand(c, status) {
   // Alla skivor som läggs till medan Lägg till-vyn är öppen (sökning, kön, snabbskanning) räknas i
   // "Klar (n)" och visas i backen när vyn stängs.
   if ($('#addView').classList.contains('open')) { addSession.push(rec.id); updateAddDone(); }
+  // Kom skivan från "Sök med text" för en köpost tas köposten bort först nu.
+  if (pendingQueueId) {
+    const qi = scanQueue.findIndex(q => q.id === pendingQueueId);
+    pendingQueueId = null;
+    if (qi >= 0) { dropQueue(qi); renderQueue(); }
+  }
   matchSpotify(rec);
   return rec;
 }
@@ -1777,13 +1871,14 @@ function dropQueue(i) {
   const q = scanQueue[i]; if (!q) return;
   markDeleted(q.id); scanQueue.splice(i, 1); saveQueue();
 }
-const findExisting = c => recs.find(r => r.dId === c.dId || (c.masterId && r.masterId === c.masterId));
+// Samma Discogs-post (id och typ, en master och en utgåva kan ha samma nummer) eller samma album.
+const findExisting = c => recs.find(r => sameRec(r, c) || (c.masterId && r.masterId === c.masterId));
 let batching = false;
 async function batchScan() {
   if (nativeVer() < 3) { toast('Installera senaste appversionen från GitHub för snabbskanning.', 4000); return; }
   if (!cfg.discogs) { toast('Lägg in din Discogs-token under ⚙︎ först.'); return; }
   if (batching) return;
-  batching = true;
+  batching = true; pendingQueueId = null;
   const st = { scanned: 0, added: 0, dup: 0, review: 0 };
   const box = (big, small = '') => $('#addStatus').innerHTML = `<div class="scanbox"><div class="m">Snabbskanning · ${st.scanned} skannade · ${st.added} tillagda${st.dup ? ` · ${st.dup} fanns redan` : ''}${st.review ? ` · ${st.review} att granska` : ''}</div><div class="big">${big}</div><div class="m">${small}</div></div>`;
   $('#addResults').innerHTML = '';
@@ -1858,6 +1953,7 @@ function renderQueue() {
 }
 $('#queueBox').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.search == null) pendingQueueId = null;   // annat val i kön: glöm "Sök med text"
   if (b.dataset.del != null) { dropQueue(+b.dataset.del); renderQueue(); return; }
   if (b.dataset.retry != null) {
     const q = scanQueue[+b.dataset.retry]; if (!q) return;
@@ -1876,7 +1972,9 @@ $('#queueBox').addEventListener('click', e => {
     return;
   }
   if (b.dataset.search != null) {
-    dropQueue(+b.dataset.search); renderQueue();
+    // Köposten ligger kvar tills en skiva faktiskt läggs till från sökningen (se addRecFromCand).
+    const q = scanQueue[+b.dataset.search]; if (!q) return;
+    pendingQueueId = q.id;
     $('#aq').value = ''; $('#aq').focus(); toast('Skriv artist och album och tryck sök'); return;
   }
   const q = scanQueue[+b.dataset.q]; if (!q) return;
@@ -1916,17 +2014,49 @@ $('#statsSheet').addEventListener('click', e => {
   if (ri) { closeStats(); openDetail(ri.dataset.rid); return; }
   const m = e.target.closest('[data-missing]');
   if (m) { openMissing(m.dataset.missing); return; }
+  const fb = e.target.closest('[data-fk]');
+  if (fb) { closeStats(); showFiltered(fb.dataset.fk, fb.dataset.fv); return; }
+  if (e.target.closest('#stShare')) { shareWants(); return; }
   if (e.target.closest('#closeStats')) closeStats();
 });
 $('#btnStats').onclick = () => openStats();
-$('#worth').addEventListener('click', e => { const a = e.target.closest('[data-act=deals]'); if (a) { e.preventDefault(); openStats('deals'); } });
+$('#worth').addEventListener('click', e => {
+  const a = e.target.closest('[data-act]'); if (!a) return;
+  e.preventDefault();
+  if (a.dataset.act === 'deals') openStats('deals');
+  else if (a.dataset.act === 'share') shareWants();
+});
 
-function barRows(entries, fmt = v => v) {
+/* ---------------- Dela önskelistan ---------------- */
+// Önskelistan som text (sorterad som i backen), med utgåva och ungefärligt pris på Discogs.
+function wantsText() {
+  const want = sortRecs(recs.filter(r => r.status === 'want'));
+  const lines = want.map(r => {
+    const rel = [r.year, r.format, labelOf(r)].filter(Boolean).join(', ');
+    const low = r.price?.low ? `från ca ${money(r.price.low.v, r.price.low.c)}` : '';
+    return `• ${r.artist} – ${r.title}${rel ? ` (${rel})` : ''}${low ? ` · ${low}` : ''}`;
+  });
+  return `Min önskelista – vinyl (${want.length} st)\n\n${lines.join('\n')}\n\nPriser enligt Discogs ${new Date().toLocaleDateString('sv-SE')}.`;
+}
+async function shareWants() {
+  const text = wantsText();
+  // Android-appen (v5) öppnar telefonens dela-meny. I en webbläsare: navigator.share, annars urklipp.
+  if (nativeVer() >= 5) { App.share(text, 'Min önskelista'); return; }
+  try {
+    if (navigator.share) { await navigator.share({ title: 'Min önskelista', text }); return; }
+  } catch (e) { if (e.name === 'AbortError') return; }
+  try { await navigator.clipboard.writeText(text); toast('Önskelistan är kopierad – klistra in den där du vill dela den.', 4000); }
+  catch { toast('Kunde inte dela. Installera senaste appversionen från GitHub (Releases).', 4000); }
+}
+
+// fk: filtret (dec/genre/label) som en tryckning på raden öppnar backen med.
+function barRows(entries, fmt = v => v, fk = '') {
   const max = Math.max(1, ...entries.map(e => e[1]));
-  return `<div class="bars">${entries.map(([k, v, title]) => `
-    <span class="lb" title="${esc(title || k)}">${esc(k)}</span>
-    <div class="tr0" title="${esc((title || k) + ': ' + fmt(v))}"><div class="br" style="width:${(100 * v / max).toFixed(1)}%"></div></div>
-    <span class="vl">${esc(fmt(v))}</span>`).join('')}</div>`;
+  const f = k => fk ? ` data-fk="${fk}" data-fv="${esc(k)}"` : '';
+  return `<div class="bars${fk ? ' click' : ''}">${entries.map(([k, v, title]) => `
+    <span class="lb" title="${esc(title || k)}"${f(k)}>${esc(k)}</span>
+    <div class="tr0" title="${esc((title || k) + ': ' + fmt(v))}"${f(k)}><div class="br" style="width:${(100 * v / max).toFixed(1)}%"></div></div>
+    <span class="vl"${f(k)}>${esc(fmt(v))}</span>`).join('')}</div>`;
 }
 function recRows(list, right) {
   return `<div class="rlist">${list.map(r => `
@@ -1950,10 +2080,10 @@ function openStats(focus) {
   const watched = want.filter(r => r.watch && !isDeal(r));
 
   // Decennier i ordning, inte efter antal.
-  const dec = countBy(have, r => r.year ? Math.floor(r.year / 10) * 10 + '-tal' : null).sort((a, b) => a[0].localeCompare(b[0]));
+  const dec = countBy(have, decOf).sort((a, b) => a[0].localeCompare(b[0]));
   const genres = countBy(have, r => r.genre).slice(0, 8);
   const genreMissing = have.filter(r => !r.genre).length;
-  const labels = countBy(have, r => r.label?.replace(/\s*\(\d+\)$/, '')).slice(0, 8);
+  const labels = countBy(have, labelOf).slice(0, 8);
   const artists = countBy(have, r => /^various/i.test(r.artist) ? null : r.artist).slice(0, 8);
   // Tillagda per månad, senaste 12 månaderna (även tomma månader).
   const months = [];
@@ -1976,6 +2106,7 @@ function openStats(focus) {
       <div class="kpi"><b>${want.length}</b><span>vill ha</span></div>
       <div class="kpi"><b>${loans.length}</b><span>utlånade</span></div>
     </div>
+    ${want.length ? '<div class="actions" style="margin-top:8px"><button id="stShare">Dela önskelistan</button></div>' : ''}
     <div class="kpi" style="margin-top:8px"><span>Samlingens värde (${esc(condShort(cfg.cond || 'Very Good Plus (VG+)'))})</span><b>${total}</b>
       <span>${valued.length} av ${have.length} värderade</span>
       ${whPts.length >= 2 ? sparkSvg(whPts) + `<span>Sedan ${esc(new Date(whPts[0].t).toLocaleDateString('sv-SE'))}: ${money(whPts[0].v, whC)} → ${money(whPts[whPts.length - 1].v, whC)}</span>` : '<span style="display:block;margin-top:4px">Grafen fylls på allt eftersom priserna uppdateras.</span>'}
@@ -1992,11 +2123,12 @@ function openStats(focus) {
     ${top.length ? `<h3>Dyraste skivorna</h3>${recRows(top, r => money(valueOf(r).v, valueOf(r).c))}` : ''}
     ${rises.length ? `<h3>Största värdeökningar</h3>${recRows(rises.map(x => x[0]), r => { const x = rises.find(y => y[0] === r); return `+${money(x[1], x[2])}`; })}` : ''}
 
-    ${dec.length ? `<h3>Decennier</h3>${barRows(dec)}` : ''}
+    ${dec.length ? `<h3>Decennier</h3>${barRows(dec, undefined, 'dec')}` : ''}
     <h3>Genrer</h3>
-    ${genres.length ? barRows(genres) : ''}
+    ${genres.length ? barRows(genres, undefined, 'genre') : ''}
     ${genreMissing ? `<p class="note">${genreMissing} skivor saknar genre än – den hämtas från Discogs i bakgrunden.</p>` : ''}
-    ${labels.length ? `<h3>Skivbolag</h3>${barRows(labels)}` : ''}
+    ${labels.length ? `<h3>Skivbolag</h3>${barRows(labels, undefined, 'label')}` : ''}
+    ${dec.length || genres.length || labels.length ? '<p class="note">Tryck på en rad för att visa de skivorna i backen.</p>' : ''}
     ${artists.length ? `<h3>Mest representerade artister</h3>${barRows(artists)}
       <p class="note">Se vad som saknas: ${artists.slice(0, 5).map(([a]) => `<a href="#" data-missing="${esc(a)}">${esc(a)}</a>`).join(' · ')}</p>` : ''}
     <h3>Tillagda per månad</h3>${barRows(months.map(([k, v]) => [mName(k), v, k]))}

@@ -7,7 +7,10 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.view.ViewGroup
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
+import android.widget.Toast
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -43,7 +46,9 @@ import java.util.concurrent.Executors
  *  - App.scan(): läser streckkod och text i fotot med ML Kit (gratis, i telefonen),
  *  - att Spotify-länkar öppnas i Spotify-appen,
  *  - att Spotify-inloggningen sker inne i appen så att svaret kommer tillbaka hit,
- *  - App.takePending(): foto/backup som blev kvar om Android stängde appen medan kameran eller filväljaren var öppen.
+ *  - App.takePending(): foto/backup som blev kvar om Android stängde appen medan kameran eller filväljaren var öppen,
+ *  - App.share(): telefonens dela-meny (t.ex. för önskelistan),
+ *  - att appen laddar om sidan i stället för att stängas om WebViews ritprocess kraschar.
  *
  * Bryggan App.* svarar bara när sidan som visas är webbappen (inte t.ex. Spotifys inloggningssidor).
  */
@@ -78,9 +83,23 @@ class MainActivity : Activity() {
     }
     private val textRecognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
-    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        createWeb()
+        // Fotot som kameran skulle spara, om appen stängts av Android medan kameran var öppen.
+        savedInstanceState?.getString("photoUri")?.let { photoUri = Uri.parse(it) }
+        // restoreState ger null om det sparade tillståndet inte gick att återställa; ladda då sidan på nytt
+        // i stället för att visa en vit skärm.
+        if (savedInstanceState == null || web.restoreState(savedInstanceState) == null) loadStart()
+    }
+
+    // ?v= gör att sidan alltid hämtas färsk vid start (GitHub Pages cachar annars i upp till 10 min).
+    private fun loadStart() = web.loadUrl(START_URL + "?v=" + System.currentTimeMillis())
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun createWeb() {
+        pageHost = null
+        fileCallback = null   // hörde till en WebView som inte finns längre; ett foto tas då emot via takePending
         web = WebView(this)
         setContentView(web)
         web.settings.javaScriptEnabled = true
@@ -98,6 +117,18 @@ class MainActivity : Activity() {
             }
             override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
                 pageHost = url?.let { Uri.parse(it).host }
+            }
+            // WebViews ritprocess har kraschat eller stängts av Android (oftast för att minnet tog slut).
+            // Utan detta stänger Android hela appen. Skapa en ny WebView och ladda sidan igen.
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                (view.parent as? ViewGroup)?.removeView(view)
+                view.destroy()
+                if (view === web && !isFinishing && !isDestroyed) {
+                    createWeb()
+                    loadStart()
+                    Toast.makeText(this@MainActivity, "Appen laddades om", Toast.LENGTH_SHORT).show()
+                }
+                return true
             }
         }
 
@@ -132,12 +163,7 @@ class MainActivity : Activity() {
             }
         }
 
-        // Fotot som kameran skulle spara, om appen stängts av Android medan kameran var öppen.
-        savedInstanceState?.getString("photoUri")?.let { photoUri = Uri.parse(it) }
         web.addJavascriptInterface(Bridge(), "App")
-        // ?v= gör att sidan alltid hämtas färsk vid start (GitHub Pages cachar annars i upp till 10 min).
-        if (savedInstanceState != null) web.restoreState(savedInstanceState)
-        else web.loadUrl(START_URL + "?v=" + System.currentTimeMillis())
     }
 
     @Deprecated("Deprecated in Java")
@@ -319,7 +345,7 @@ class MainActivity : Activity() {
         // Bara webbappen får använda bryggan, inte andra sidor som visas i appen (t.ex. Spotifys inloggning).
         private fun trusted() = pageHost == HOST
 
-        @JavascriptInterface fun version(): String = if (trusted()) "4" else "0"
+        @JavascriptInterface fun version(): String = if (trusted()) "5" else "0"
 
         /** mode: "auto" = bara om en fil redan är vald, "save" = samma fil som förut (annars välj), "pick" = välj ny plats. */
         @JavascriptInterface fun saveBackup(json: String, id: String, mode: String) {
@@ -379,6 +405,15 @@ class MainActivity : Activity() {
             worker.execute {
                 try { reply(id, true, this@MainActivity.scan(b64)) }
                 catch (e: Exception) { reply(id, false, "Kunde inte läsa av bilden: ${e.message ?: e.javaClass.simpleName}") }
+            }
+        }
+        /** Öppnar telefonens dela-meny med en text (v5). */
+        @JavascriptInterface fun share(text: String, title: String) {
+            if (!trusted()) return
+            runOnUiThread {
+                val send = Intent(Intent.ACTION_SEND).setType("text/plain")
+                    .putExtra(Intent.EXTRA_TEXT, text).putExtra(Intent.EXTRA_SUBJECT, title)
+                try { startActivity(Intent.createChooser(send, title)) } catch (_: Exception) {}
             }
         }
         // Bara http(s)- och spotify-länkar öppnas utanför appen.
