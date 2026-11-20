@@ -19,6 +19,8 @@ Samlingen sparas på telefonen. Under ⚙︎ → Backup till Google Drive sparar
 
 **Många skivor:** tryck på + och välj "Snabbskanna många skivor". Skanna streckkod efter streckkod. Säkra träffar läggs in direkt, och osäkra hamnar i "Att granska".
 
+**I skivaffären:** tryck på + och välj "Har jag den?". Skanna streckkoden så ser du om du redan har skivan eller har den på önskelistan, och vad den kostar på Discogs. Skriv in butikens pris för att jämföra.
+
 ## Kom igång
 
 1. Öppna appen, tryck på ⚙︎ och klistra in:

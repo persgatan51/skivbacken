@@ -93,6 +93,18 @@ class MainActivity : Activity() {
         if (savedInstanceState == null || web.restoreState(savedInstanceState) == null) loadStart()
     }
 
+    private val crashTimes = mutableListOf<Long>()
+    private fun showCrashPage() {
+        val html = """<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
+            <body style="background:#0f1115;color:#eef0f4;font:16px system-ui,sans-serif;padding:32px 20px">
+            <h2>Appen kraschade flera gånger</h2>
+            <p style="color:#9aa3b2">Telefonen har troligen ont om minne. Stäng andra appar och försök igen.
+            Dina skivor ligger kvar.</p>
+            <p><a href="$START_URL" style="display:inline-block;margin-top:12px;padding:12px 20px;border-radius:12px;
+            background:#e5b84b;color:#111;text-decoration:none;font-weight:600">Försök igen</a></p></body>"""
+        web.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
+    }
+
     // ?v= gör att sidan alltid hämtas färsk vid start (GitHub Pages cachar annars i upp till 10 min).
     private fun loadStart() = web.loadUrl(START_URL + "?v=" + System.currentTimeMillis())
 
@@ -100,6 +112,9 @@ class MainActivity : Activity() {
     private fun createWeb() {
         pageHost = null
         fileCallback = null   // hörde till en WebView som inte finns längre; ett foto tas då emot via takePending
+        // Samma sak för backupen: sidan som väntade på svaret finns inte längre (ritprocessen kraschade medan
+        // filväljaren var öppen). Utan id går resultatet via setPending, som den nya sidan hämtar vid start.
+        pendingSaveId = null; pendingSaveJson = null; pendingOpenId = null
         web = WebView(this)
         setContentView(web)
         web.settings.javaScriptEnabled = true
@@ -124,9 +139,17 @@ class MainActivity : Activity() {
                 (view.parent as? ViewGroup)?.removeView(view)
                 view.destroy()
                 if (view === web && !isFinishing && !isDestroyed) {
+                    // Kraschar sidan om och om igen (t.ex. minnet tar slut direkt vid start) ska appen inte
+                    // ladda om i all oändlighet: efter 3 krascher inom en minut visas ett meddelande i stället.
+                    val now = System.currentTimeMillis()
+                    crashTimes.removeAll { now - it > 60_000 }
+                    crashTimes.add(now)
                     createWeb()
-                    loadStart()
-                    Toast.makeText(this@MainActivity, "Appen laddades om", Toast.LENGTH_SHORT).show()
+                    if (crashTimes.size >= 3) showCrashPage()
+                    else {
+                        loadStart()
+                        Toast.makeText(this@MainActivity, "Appen laddades om", Toast.LENGTH_SHORT).show()
+                    }
                 }
                 return true
             }

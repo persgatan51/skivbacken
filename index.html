@@ -160,6 +160,18 @@
   .rlist .ri img,.rlist .ri .ph{width:40px;height:40px;border-radius:4px;font-size:16px}
   .rlist .ri .x{font-size:13px;text-align:right;font-variant-numeric:tabular-nums}
   .spark{width:100%;height:64px;display:block;margin-top:6px}
+  .shop .hit{display:grid;grid-template-columns:96px 1fr;gap:12px;align-items:center;margin-top:12px}
+  .shop .hit img,.shop .hit .ph{width:96px;height:96px;border-radius:8px;object-fit:cover}
+  .shop .hit .t{font-size:16px;-webkit-line-clamp:3}
+  .shop .verdict{border-radius:12px;padding:12px 14px;margin-top:12px;font-weight:700;font-size:16px;background:var(--card);border:2px solid var(--line)}
+  .shop .verdict.have{border-color:var(--sp);color:var(--sp)}
+  .shop .verdict.want{border-color:var(--acc);color:var(--acc)}
+  .shop .verdict .m{font-weight:400;font-size:13px;margin-top:4px}
+  .shop .mkt{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+  .shop .cmp{font-size:14px;margin-top:6px;min-height:20px}
+  .shop .alts .cand{cursor:pointer}
+  .shop .alts .cand.on{background:var(--card);border-radius:8px}
+  .shop .codeRow{display:flex;gap:8px;margin-top:10px}
   .spark path.l{fill:none;stroke:var(--acc);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
   .spark path.a{fill:var(--acc);opacity:.12}
 </style>
@@ -216,19 +228,22 @@
   </div>
   <div class="filters" id="aFilters">
     <select id="aFmt" aria-label="Format"><option value="vinyl">Bara vinyl</option><option value="">Alla format</option></select>
-    <select id="aYear" aria-label="Utgiven från"></select>
+    <select id="aYear" aria-label="Album utgivna från"></select>
   </div>
   <div class="shoot">
     <label class="big">📷 Fota skivan<input id="camInput" type="file" accept="image/*" capture="environment"></label>
     <label>🖼 Välj bild<input id="picInput" type="file" accept="image/*"></label>
   </div>
   <button id="btnBatch" class="batch">⚡ Snabbskanna många skivor (streckkoder)</button>
+  <button id="btnShop" class="batch">🛒 Har jag den? Kolla en skiva i butiken</button>
   <div id="addStatus"></div>
   <div id="addResults"></div>
   <div id="queueBox"></div>
 </div>
 
 <div class="sheet" id="logSheet" style="z-index:25"><div class="panel"><div class="pad" id="logBody"></div></div></div>
+
+<div class="sheet" id="shopSheet"><div class="panel"><div class="pad shop" id="shopBody"></div></div></div>
 
 <div class="sheet" id="statsSheet"><div class="panel"><div class="pad st" id="statsBody"></div></div></div>
 
@@ -484,9 +499,8 @@ function fetchPrice(r, bg) {
   priceInFlight.set(r.id, p);
   return p;
 }
-async function fetchPriceNow(r, bg) {
-  const wasDeal = isDeal(r);
-  const rid = await releaseIdOf(r, bg);
+// Prisförslag per skick och lägsta pris just nu för en utgåva (används både för skivor och i butiksläget).
+async function marketOf(rid, bg) {
   let sug = null;
   try {
     const s = await dg(`/marketplace/price_suggestions/${rid}`, {}, { bg });
@@ -498,9 +512,14 @@ async function fetchPriceNow(r, bg) {
     if (e.status === 403 || e.status === 401 || /seller/i.test(e.detail)) { cfg.needSeller = true; saveCfg(); }
   }
   const st = await dg(`/marketplace/stats/${rid}`, { curr_abbr: 'SEK' }, { bg });
-  r.price = { at: Date.now(), rid, sug,
+  return { at: Date.now(), rid, sug,
     low: st.lowest_price ? { v: st.lowest_price.value, c: st.lowest_price.currency } : null,
     n: st.num_for_sale || 0 };
+}
+async function fetchPriceNow(r, bg) {
+  const wasDeal = isDeal(r);
+  const rid = await releaseIdOf(r, bg);
+  r.price = await marketOf(rid, bg);
   delete r.priceErr;
   // Värdeutveckling: ny punkt bara när värdet ändrats, så att historiken inte växer i onödan.
   const v = valueOf(r);
@@ -690,22 +709,35 @@ const labelOf = r => (r.label || '').replace(/\s*\(\d+\)$/, '');
 const filterOn = () => !!(view.f.dec || view.f.genre || view.f.label);
 const passFilter = r => (!view.f.dec || decOf(r) === view.f.dec) && (!view.f.genre || (r.genre || []).includes(view.f.genre))
   && (!view.f.label || labelOf(r) === view.f.label);
+// Normaliserad söktext per skiva (artist, titel, utlånad till och låtar). Sparas så att sökningen inte
+// behöver köra norm() på alla låtar i hela samlingen vid varje tangenttryckning. Nyckeln gör att
+// cachen byggs om av sig själv när något av fälten ändras.
+const searchIdx = new WeakMap();
+function idxOf(r) {
+  const key = [r.artist, r.title, r.loan?.to || '', r.tracks?.length || 0].join('\u0001');
+  let x = searchIdx.get(r);
+  if (!x || x.key !== key) {
+    x = { key, meta: norm(r.artist + ' ' + r.title + ' ' + (r.loan?.to || '')),
+      tracks: (r.tracks || []).filter(t => !t.h && t.t).map(t => [norm(t.t), (t.p ? t.p + ' ' : '') + t.t]) };
+    searchIdx.set(r, x);
+  }
+  return x;
+}
 // Första låten på skivan vars titel innehåller sökningen (minst 3 tecken), för "Sök på låt".
 function trackHit(r, q) {
-  if (!q || q.length < 3 || !r.tracks) return null;
-  const t = r.tracks.find(t => !t.h && t.t && norm(t.t).includes(q));
-  return t ? (t.p ? t.p + ' ' : '') + t.t : null;
+  if (!q || q.length < 3) return null;
+  const t = idxOf(r).tracks.find(t => t[0].includes(q));
+  return t ? t[1] : null;
 }
 // Skivorna som syns just nu: vald flik, sökning och filter, sorterade.
 function visibleList() {
   const q = norm(view.q);
   return sortRecs(recs.filter(r => (view.tab === 'all' || r.status === view.tab) && passFilter(r)
-    && (!q || norm(r.artist + ' ' + r.title + ' ' + (r.loan?.to || '')).includes(q) || trackHit(r, q))));
+    && (!q || idxOf(r).meta.includes(q) || trackHit(r, q))));
 }
 // Låten som gav träff, om skivan bara hittades via låtlistan.
-function songMatch(r) {
-  const q = norm(view.q);
-  if (!q || norm(r.artist + ' ' + r.title + ' ' + (r.loan?.to || '')).includes(q)) return null;
+function songMatch(r, q = norm(view.q)) {
+  if (!q || idxOf(r).meta.includes(q)) return null;
   return trackHit(r, q);
 }
 // Fyller i filterlistorna utifrån skivorna i vald flik (med antal), och markerar de som är valda.
@@ -713,16 +745,21 @@ function fillFilters() {
   const base = recs.filter(r => view.tab === 'all' || r.status === view.tab);
   const opts = (el, all, entries, val) => {
     if (val && !entries.some(e => e[0] === val)) entries.unshift([val, 0]);
-    el.innerHTML = `<option value="">${all}</option>` + entries.map(([k, n]) =>
+    const html = `<option value="">${all}</option>` + entries.map(([k, n]) =>
       `<option value="${esc(k)}"${k === val ? ' selected' : ''}>${esc(k)}${n ? ` (${n})` : ''}</option>`).join('');
+    // Skriv bara om listan när den ändrats, och aldrig medan den är öppen (då stängs eller hoppar
+    // telefonens väljare). Den fylls i igen när man lämnar den (onblur nedan).
+    if (el._html !== html && document.activeElement !== el) { el.innerHTML = html; el._html = html; }
     el.classList.toggle('on', !!val);
   };
   opts($('#fDec'), 'Alla decennier', countBy(base, decOf).sort((a, b) => a[0].localeCompare(b[0])), view.f.dec);
   opts($('#fGenre'), 'Alla genrer', countBy(base, r => r.genre), view.f.genre);
   opts($('#fLabel'), 'Alla skivbolag', countBy(base, labelOf).slice(0, 60), view.f.label);
 }
-for (const [id, k] of [['#fDec', 'dec'], ['#fGenre', 'genre'], ['#fLabel', 'label']])
+for (const [id, k] of [['#fDec', 'dec'], ['#fGenre', 'genre'], ['#fLabel', 'label']]) {
   $(id).onchange = e => { view.f[k] = e.target.value; render(); };
+  $(id).onblur = () => { if (!$('#searchRow').hidden) fillFilters(); };
+}
 // Öppnar backen med ett filter (t.ex. från en stapel i statistiken).
 function showFiltered(k, v) {
   view.f = { dec: '', genre: '', label: '', [k]: v };
@@ -752,7 +789,8 @@ function render() {
 
   if (view.mode === 'crate') { gridSig = ''; crateSet(list, emptyMsg); return; }
   // Rutnätet byggs bara om när något som syns har ändrats (inte när ett pris kommer in i bakgrunden).
-  const sig = view.tab + '\n' + emptyMsg + '\n' + list.map(r => [r.id, r.cover, r.title, r.artist, r.year, r.loan?.to, isDeal(r), songMatch(r)].join('|')).join('\n');
+  const nq = norm(view.q), songs = new Map(list.map(r => [r.id, songMatch(r, nq)]));
+  const sig = view.tab + '\n' + emptyMsg + '\n' + list.map(r => [r.id, r.cover, r.title, r.artist, r.year, r.loan?.to, isDeal(r), songs.get(r.id)].join('|')).join('\n');
   if (sig === gridSig) return;
   gridSig = sig;
   if (emptyMsg) { $('#list').innerHTML = `<div class="msg">${emptyMsg}</div>`; return; }
@@ -761,13 +799,15 @@ function render() {
       ${r.cover ? `<img class="cover" loading="lazy" decoding="async" src="${esc(r.cover)}" alt="">` : '<div class="ph">♪</div>'}
       <div class="t">${esc(r.title)}</div>
       <div class="m">${esc(r.artist)}${r.year ? ' · ' + esc(r.year) : ''}</div>
-      ${songMatch(r) ? `<div class="m" style="color:var(--acc)">♪ ${esc(songMatch(r))}</div>` : ''}
+      ${songs.get(r.id) ? `<div class="m" style="color:var(--acc)">♪ ${esc(songs.get(r.id))}</div>` : ''}
       ${r.loan ? `<div class="m">Utlånad till ${esc(r.loan.to)}</div>` : ''}${isDeal(r) ? '<div class="m" style="color:var(--sp)">Fynd!</div>' : ''}
     </button>`).join('') + '</div>';
 }
 $('#list').addEventListener('click', e => { const b = e.target.closest('.item'); if (b) openDetail(b.dataset.id); });
 document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { view.tab = b.dataset.tab; crate.pos = 0; crate.target = null; render(); scrollTo(0, 0); });
-$('#filter').oninput = e => { view.q = e.target.value; render(); };
+// Vänta tills man slutat skriva en kort stund innan listan ritas om, så att inmatningen inte hackar.
+let filterT;
+$('#filter').oninput = e => { view.q = e.target.value; clearTimeout(filterT); filterT = setTimeout(render, 150); };
 $('#btnSearch').onclick = () => {
   const row = $('#searchRow'); row.hidden = !row.hidden;
   if (row.hidden) { $('#filter').value = ''; view.q = ''; view.f = { dec: '', genre: '', label: '' }; render(); }
@@ -1167,7 +1207,9 @@ const rank = m => [...m.values()].sort((a, b) => b.score - a.score).slice(0, 8);
    tills det finns tillräckligt många träffar efter filtret. */
 let textSearch = null;   // { q, type, page, pages, total } för sökningen som visas nu
 const minYear = () => parseInt(cfg.aYear) || 0;
-const yearOk = c => !minYear() || (c.year && c.year >= minYear());
+// Träffar där Discogs saknar år visas alltid (annars försvann de helt). För album (master) är året
+// albumets första utgivningsår, inte pressningens.
+const yearOk = c => !minYear() || !c.year || c.year >= minYear();
 async function textPage(st) {
   const j = await dg('/database/search', { q: st.q, type: st.type, per_page: 50, page: st.page, ...fmtP() });
   st.pages = j.pagination?.pages || 1;
@@ -1241,6 +1283,7 @@ function fail(e) { $('#addStatus').innerHTML = `<div class="msg">${esc(e.message
 
 async function onPhoto(file) {
   if (!file) return;
+  pendingQueueId = null;   // ett foto är en ny skiva, inte den köpost man tryckt "Sök med text" på
   $('#addResults').innerHTML = '';
   const readBox = html => `<div class="read">${html}<br><span class="m">Blev det fel? Rätta texten i sökfältet och tryck sök.</span></div>`;
   try {
@@ -1295,7 +1338,7 @@ async function runText(q) {
 }
 // Filtren i Lägg till: sparas, och gör om textsökningen om en sådan visas.
 const YEARS = [0, 1960, 1970, 1980, 1990, 2000, 2010, 2020];
-$('#aYear').innerHTML = YEARS.map(y => `<option value="${y || ''}">${y ? 'Från ' + y : 'Alla år'}</option>`).join('');
+$('#aYear').innerHTML = YEARS.map(y => `<option value="${y || ''}">${y ? 'Album från ' + y : 'Alla år'}</option>`).join('');
 function syncAddFilters() {
   $('#aFmt').value = cfg.aFmt === '' ? '' : 'vinyl';
   $('#aYear').value = cfg.aYear ? String(cfg.aYear) : '';
@@ -1317,7 +1360,7 @@ function showCands(cands, fromText = false) {
   const st = textSearch;
   const more = st && st.page < st.pages
     ? `<div class="actions" style="margin:10px 0"><button id="aMore">Visa fler</button></div>` : '';
-  const filt = [cfg.aFmt !== '' ? 'bara vinyl' : '', minYear() ? 'från ' + minYear() : ''].filter(Boolean).join(', ');
+  const filt = [cfg.aFmt !== '' ? 'bara vinyl' : '', minYear() ? 'album från ' + minYear() : ''].filter(Boolean).join(', ');
   if (!cands.length) {
     $('#addResults').innerHTML = `<div class="msg">Ingen träff i Discogs${filt ? ` (${filt})` : ''}. ${filt ? 'Prova att ändra filtret ovanför, eller' : 'Prova att'} skriva artist och album i sökfältet.</div>` + more;
     return;
@@ -1664,8 +1707,17 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-19b';
+const WEB_VERSION = '2026-11-20';
 const CHANGELOG = [
+  { d: '2026-11-20', t: 'Butiksläge: Har jag den?', i: [
+    'Ny: 🛒 "Har jag den?" under +. Skanna en skiva i butiken eller på loppis utan att lägga till den. Appen säger om du har den (eller albumet i en annan utgåva), om den står på önskelistan eller om den är ny.',
+    'Butiksläget visar lägsta pris och prisförslag på Discogs för just den utgåvan. Skriv in butikens pris så ser du direkt om det är billigt eller dyrt.',
+    'Köpt skivan? Lägg den i Har med en tryckning, eller flytta den från önskelistan. Skanna nästa direkt efteråt.',
+    'Rättat: sökningen i hyllan hackar inte längre när du skriver, även med många skivor och låtlistor.',
+    'Rättat: filterlistorna (decennium, genre, skivbolag) stängs inte längre av sig själva när appen hämtar data i bakgrunden.',
+    '"Album från år" visar nu även träffar där Discogs saknar år (de försvann förut). Året är albumets första utgivningsår.',
+    'Rättat: om du tryckt "Sök med text" i "Att granska" och sedan fotade en annan skiva kunde fel köpost tas bort.',
+    'Android-appen: en backup du valde i filväljaren kunde tappas om appen laddades om under tiden. Kraschar appen flera gånger i rad visas ett meddelande i stället för att den laddar om i en evig loop.' ] },
   { d: '2026-11-19', t: 'Filter när du söker fram skivor', i: [
     'Ny: när du lägger till skivor visas bara vinyl som standard. Välj "Alla format" om du vill se CD, kassett m.m.',
     'Ny: filtrera bort äldre skivor med "Från år" (t.ex. från 1990). Valen sparas till nästa gång.',
@@ -2014,6 +2066,199 @@ async function searchBarcode(code, onWait = () => {}) {
     }
   }
 }
+/* ---------------- Butiksläge: "Har jag den?" ----------------
+   Skanna en streckkod i skivaffären eller på loppis utan att lägga till skivan. Appen svarar om du har den,
+   om den står på önskelistan eller om den är ny, och visar Discogs priser att jämföra med prislappen. */
+const shop = { cands: [], i: 0, code: '', market: new Map(), busy: false };
+const shopOpen = () => $('#shopSheet').classList.contains('open');
+const closeShop = () => $('#shopSheet').classList.remove('open');
+const canScanNative = () => nativeVer() >= 3;
+function openShop() {
+  if (!cfg.discogs) { toast('Lägg in din Discogs-token under ⚙︎ först.'); return; }
+  pendingQueueId = null;
+  shop.cands = []; shop.i = 0; shop.code = '';
+  $('#shopSheet').classList.add('open');
+  shopDraw();
+  if (canScanNative()) shopScan();
+}
+// Knappar för att skanna nästa: Googles skanner i appen, annars ett foto av streckkoden. Plus inmatning för hand.
+const shopScanBtns = () => `
+  <div class="actions">
+    ${canScanNative() ? `<button data-act="scan" class="play" style="background:var(--acc);border-color:var(--acc);color:#111">📷 Skanna ${shop.cands.length || shop.code ? 'nästa' : 'streckkod'}</button>`
+      : `<label class="batch" style="display:block;text-align:center;background:var(--acc);color:#111;margin:0">📷 Fota streckkoden<input id="shopCam" type="file" accept="image/*" capture="environment" hidden></label>`}
+  </div>
+  <div class="codeRow"><input id="shopCode" inputmode="numeric" enterkeyhint="search" autocomplete="off" placeholder="…eller skriv siffrorna under streckkoden"><button data-act="code">Sök</button></div>`;
+function shopDraw(msg) {
+  const c = shop.cands[shop.i];
+  let html = `<div class="row"><h2 style="flex:1">Har jag den?</h2><button data-act="close">Stäng</button></div>`;
+  if (msg) html += `<div class="msg">${msg}</div>`;
+  else if (!c && !shop.code) html += `<p class="note">Skanna streckkoden på baksidan. Appen säger om du redan har skivan och vad den brukar kosta på Discogs. Inget läggs till förrän du trycker på en knapp.</p>`;
+  else if (!c) html += `<div class="msg">Streckkod ${esc(shop.code)} finns inte i Discogs.<br>Prova att söka på artist och album i Lägg till i stället.</div>`;
+  else html += shopHit(c);
+  html += shopScanBtns();
+  $('#shopBody').innerHTML = html;
+  if (c) { shopMarket(c); shopCompare(); }
+}
+// Vad du redan har: samma utgåva (samma Discogs-post) eller samma album i en annan utgåva.
+function shopMatches(c) {
+  const exact = recs.filter(r => sameRec(r, c));
+  const album = c.masterId ? recs.filter(r => !exact.includes(r) && r.masterId === c.masterId) : [];
+  return { exact, album };
+}
+const relDesc = r => r.dType === 'master' ? 'utgåva inte vald' : [r.year, r.format, r.country].filter(Boolean).join(', ') || 'annan utgåva';
+const watchDesc = r => r.watch ? ` · bevakad under ${money(r.watch, 'SEK')}` : '';
+function shopHit(c) {
+  const { exact, album } = shopMatches(c);
+  const eHave = exact.find(r => r.status === 'have'), eWant = exact.find(r => r.status === 'want');
+  const aHave = album.filter(r => r.status === 'have'), aWant = album.filter(r => r.status === 'want');
+  const lines = [];
+  if (eHave) lines.push(['have', '✓ Du har den här skivan', [eHave.loan ? `Utlånad till ${esc(eHave.loan.to)}` : '', eHave.added ? `Tillagd ${today_(eHave.added)}` : ''].filter(Boolean).join(' · ')]);
+  else if (aHave.length) lines.push(['have', '✓ Du har albumet i en annan utgåva', aHave.slice(0, 3).map(r => esc(relDesc(r))).join('<br>')]);
+  if (eWant) lines.push(['want', '♥ Står på din önskelista', esc(watchDesc(eWant).replace(/^ · /, ''))]);
+  else if (aWant.length && !eHave) lines.push(['want', '♥ Albumet står på din önskelista', aWant.slice(0, 2).map(r => esc(relDesc(r) + watchDesc(r))).join('<br>')]);
+  if (!lines.length) lines.push(['new', 'Ny – den har du inte', '']);
+  const meta = [c.year, c.format, c.label, c.country, c.catno].filter(Boolean).join(' · ');
+  const alts = shop.cands.length > 1 ? `<h3 style="margin:16px 0 0;font-size:14px">Streckkoden passar ${shop.cands.length} utgåvor – tryck på rätt</h3>
+    <div class="alts">${shop.cands.map((x, i) => `<div class="cand${i === shop.i ? ' on' : ''}" data-ci="${i}">
+      ${x.thumb ? `<img src="${esc(x.thumb)}" alt="">` : '<div class="ph">♪</div>'}
+      <div><div class="t">${esc(x.title)}</div><div class="m">${esc(x.artist)} · ${esc([x.year, x.format, x.country].filter(Boolean).join(' · '))}</div></div></div>`).join('')}</div>` : '';
+  // Knappar: köpt (lägg i Har eller flytta från önskelistan) och Vill ha.
+  const btns = [], wantRec = eWant || aWant[0];
+  if (!eHave) {
+    btns.push(wantRec ? `<button data-act="bought" style="background:var(--sp);border-color:var(--sp);color:#04140a">Köpt! Flytta från önskelistan till Har</button>`
+      : `<button data-act="add" data-s="have" style="background:var(--sp);border-color:var(--sp);color:#04140a">Köpt! Lägg i Har</button>`);
+    if (!wantRec) btns.push(`<button data-act="add" data-s="want">♥ Lägg på önskelistan</button>`);
+  }
+  return `<div class="hit">${c.cover || c.thumb ? `<img src="${esc(c.cover || c.thumb)}" alt="">` : '<div class="ph">♪</div>'}
+      <div><div class="t">${esc(c.title)}</div><div class="m">${esc(c.artist)}</div><div class="m">${esc(meta)}</div></div></div>
+    ${lines.map(([cls, big, small]) => `<div class="verdict ${cls}">${big}${small ? `<div class="m">${small}</div>` : ''}</div>`).join('')}
+    <div id="shopMkt"></div>
+    <input id="shopPrice" type="number" inputmode="numeric" min="0" placeholder="Pris i butiken (kr) – jämför med Discogs" style="margin-top:10px">
+    <div class="cmp" id="shopCmp"></div>
+    <div class="actions">${btns.join('')}
+      <div class="split"><button data-act="dg">Visa på Discogs</button><button data-act="sellers">Till salu på Discogs</button></div>
+    </div>${alts}`;
+}
+// Priserna hämtas en gång per utgåva och visas i en egen ruta, så att prisfältet inte tappar det man skrivit.
+async function shopMarket(c) {
+  const box = () => $('#shopMkt');
+  const draw = () => {
+    const m = shop.market.get(c.dId), el = box();
+    if (!el || shop.cands[shop.i] !== c) return;
+    if (!m || m.loading) { el.innerHTML = '<div class="msg" style="padding:12px"><span class="spin"></span>Hämtar priser från Discogs…</div>'; return; }
+    if (m.err) { el.innerHTML = `<div class="msg" style="padding:12px">${esc(m.err)} <a href="#" data-act="mkt">Försök igen</a></div>`; return; }
+    const sug = m.sug?.[cfg.cond || 'Very Good Plus (VG+)'];
+    el.innerHTML = `<div class="mkt">
+      <div class="kpi"><span>Lägsta pris just nu</span><b>${m.low ? money(m.low.v, m.low.c) : '–'}</b><span>${m.n ? `${m.n} till salu` : 'ingen säljer den nu'}</span></div>
+      <div class="kpi"><span>Prisförslag ${esc(condShort(cfg.cond || 'Very Good Plus (VG+)'))}</span><b>${sug ? money(sug.v, sug.c) : '–'}</b>
+        <span>${sug ? 'enligt Discogs försäljningar' : cfg.needSeller ? 'kräver säljarinställningar' : 'inget förslag'}</span></div></div>
+      <p class="note">Discogs priser gäller utgåvan ovan, plus frakt. Begagnat i butik är ofta i sämre skick – kolla skivan.</p>`;
+    shopCompare();
+  };
+  if (!shop.market.has(c.dId)) {
+    shop.market.set(c.dId, { loading: true });
+    draw();
+    try { shop.market.set(c.dId, await marketOf(c.dId)); }
+    catch (e) { shop.market.set(c.dId, { err: e.status === 404 ? 'Discogs har inga priser för utgåvan.' : e.message }); }
+  }
+  draw();
+}
+// Jämför butikens pris med Discogs (bara i kronor).
+function shopCompare() {
+  const el = $('#shopCmp'), c = shop.cands[shop.i]; if (!el || !c) return;
+  const v = Math.round(+($('#shopPrice')?.value || 0)), m = shop.market.get(c.dId);
+  if (!v || !m || m.loading || m.err) { el.innerHTML = ''; return; }
+  const sug = m.sug?.[cfg.cond || 'Very Good Plus (VG+)'];
+  const parts = [];
+  const diff = (ref, name) => {
+    if (!ref || (ref.c || 'SEK') !== 'SEK') return;
+    const d = Math.round(v - ref.v);
+    parts.push(Math.abs(d) < 15 ? `ungefär som ${name}` : d < 0 ? `<b style="color:var(--sp)">${money(-d, 'SEK')} under</b> ${name}` : `<b style="color:#ff8a80">${money(d, 'SEK')} över</b> ${name}`);
+  };
+  diff(sug, 'prisförslaget'); diff(m.low, 'lägsta priset');
+  el.innerHTML = parts.length ? parts.join(' · ') : '';
+}
+async function shopScan() {
+  if (shop.busy) return;
+  let code;
+  try { code = await native(id => App.scanBarcode(id)); }
+  catch (e) { if (e.message !== 'cancel') toast('Skannern: ' + e.message.replace(/^fail:/, ''), 4000); return; }
+  shopLookup(code);
+}
+async function shopPhoto(file) {
+  if (!file) return;
+  shopDraw('<span class="spin"></span>Letar efter streckkod…');
+  const scan = await scanPhoto(file);
+  if (scan.barcodes?.length) shopLookup(scan.barcodes[0]);
+  else { shopDraw(); toast('Hittade ingen streckkod i fotot. Skriv siffrorna i stället.', 4000); }
+}
+async function shopLookup(raw) {
+  const code = String(raw || '').replace(/\D/g, '');
+  if (!code || shop.busy) return;
+  shop.busy = true; shop.code = code; shop.cands = []; shop.i = 0;
+  shopDraw(`<span class="spin"></span>Söker streckkod ${esc(code)}…`);
+  try {
+    const res = await searchBarcode(code, (msg, wait) => shopDraw(`<span class="spin"></span>${esc(msg)}<br><span class="m">Försöker igen om ${Math.round(wait / 1000)} s</span>`));
+    if (res.err) { shopDraw(`${esc(res.err.message)}<br><a href="#" data-act="retry">Försök igen</a>`); return; }
+    // Utgåvor som redan finns i samlingen först, så att svaret på "har jag den?" syns direkt.
+    shop.cands = res.cands.slice(0, 8);
+    const own = shop.cands.findIndex(c => shopMatches(c).exact.length);
+    shop.i = own >= 0 ? own : 0;
+    shopDraw();
+  } finally { shop.busy = false; }
+}
+// Lägger till skivan med priset som redan hämtats (så att det inte hämtas en gång till).
+function shopAdd(status) {
+  const c = shop.cands[shop.i]; if (!c) return;
+  const rec = addRecFromCand(c, status);
+  const m = shop.market.get(c.dId);
+  if (m && !m.loading && !m.err) {
+    rec.price = m;
+    const v = valueOf(rec); if (v) rec.priceHist = addHistPoint([], { t: m.at, v: v.v, c: v.c });
+    saveRecs();
+  }
+  render(); setTimeout(resolveArtists, 2000);
+  toast(status === 'have' ? `${rec.title} ligger nu i hyllan` : `${rec.title} ligger på önskelistan`);
+  shopDraw();
+}
+$('#shopSheet').addEventListener('click', e => {
+  if (e.target.id === 'shopSheet') { closeShop(); return; }
+  const alt = e.target.closest('[data-ci]');
+  if (alt) { shop.i = +alt.dataset.ci; shopDraw(); return; }
+  const a = e.target.closest('[data-act]'); if (!a) return;
+  if (a.tagName === 'A') e.preventDefault();
+  const c = shop.cands[shop.i];
+  switch (a.dataset.act) {
+    case 'close': closeShop(); break;
+    case 'scan': shopScan(); break;
+    case 'code': shopLookup($('#shopCode').value); break;
+    case 'retry': shopLookup(shop.code); break;
+    case 'mkt': if (c) { shop.market.delete(c.dId); shopMarket(c); } break;
+    case 'add': shopAdd(a.dataset.s); break;
+    case 'bought': {
+      if (!c) break;
+      const { exact, album } = shopMatches(c);
+      const r = exact.find(x => x.status === 'want') || album.find(x => x.status === 'want'); if (!r) break;
+      // Stod albumet på önskelistan (eller en annan utgåva): byt till utgåvan du faktiskt köpte.
+      if (!sameRec(r, c)) {
+        for (const k of ['dType', 'dId', 'masterId', 'year', 'format', 'label', 'country', 'catno']) r[k] = c[k];
+        if (c.cover) { r.cover = c.cover; r.thumb = c.thumb; }
+        delete r.rid; delete r.price; delete r.priceHist; delete r.relLabel;
+      }
+      r.status = 'have'; r.added = Date.now(); delete r.dealSeen; delete r.watch;
+      const m = shop.market.get(c.dId);
+      if (m && !m.loading && !m.err) { r.price = m; const v = valueOf(r); if (v) r.priceHist = addHistPoint(r.priceHist || [], { t: m.at, v: v.v, c: v.c }); }
+      saveRecs(); crateForget(r.id); gridSig = ''; render();
+      toast(`${r.title} flyttad till Har`); shopDraw(); break;
+    }
+    case 'dg': if (c) openUrl(`https://www.discogs.com/${c.dType === 'master' ? 'master' : 'release'}/${c.dId}`); break;
+    case 'sellers': if (c) openUrl(`https://www.discogs.com/sell/release/${c.dId}?currency=SEK`); break;
+  }
+});
+$('#shopSheet').addEventListener('input', e => { if (e.target.id === 'shopPrice') shopCompare(); });
+$('#shopSheet').addEventListener('keydown', e => { if (e.target.id === 'shopCode' && e.key === 'Enter') { e.target.blur(); shopLookup(e.target.value); } });
+$('#shopSheet').addEventListener('change', e => { if (e.target.id === 'shopCam') { shopPhoto(e.target.files[0]); e.target.value = ''; } });
+$('#btnShop').onclick = openShop;
 function renderQueue() {
   const el = $('#queueBox');
   if (!scanQueue.length) { el.innerHTML = ''; return; }
@@ -2316,6 +2561,7 @@ window.__checkPending = checkPending;
 /* ---------------- Bakåtknapp i appen ---------------- */
 window.__back = () => {
   if ($('#logSheet').classList.contains('open')) { closeLog(); return true; }
+  if (shopOpen()) { closeShop(); return true; }
   if (statsOpen()) { closeStats(); return true; }
   if ($('#settings').classList.contains('open')) { closeSettings(); return true; }
   if ($('#detail').classList.contains('open')) { closeDetail(); return true; }
