@@ -507,7 +507,9 @@ async function marketOf(rid, bg) {
     if (s && Object.keys(s).length) sug = Object.fromEntries(Object.entries(s).map(([k, v]) => [k, { v: v.value, c: v.currency }]));
     if (cfg.needSeller && sug) { cfg.needSeller = false; saveCfg(); }
   } catch (e) {
-    if (e.status === 429) throw e;
+    // Tillfälliga fel (för många anrop, inget nät, fel hos Discogs) ska inte spara "inget prisförslag",
+    // annars försvinner skivans värde i en vecka och värdehistoriken får en falsk punkt.
+    if (e.status === 429 || e.net || e.status >= 500) throw e;
     // Prisförslag kräver att säljarinställningarna är ifyllda på Discogs.
     if (e.status === 403 || e.status === 401 || /seller/i.test(e.detail)) { cfg.needSeller = true; saveCfg(); }
   }
@@ -1707,8 +1709,14 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-20';
+const WEB_VERSION = '2026-11-21';
 const CHANGELOG = [
+  { d: '2026-11-21', t: 'Rättningar i butiksläget', i: [
+    'Rättat: "Har jag den?" känner nu igen utgåvan du själv valt för ett album (tidigare stod det "annan utgåva – utgåva inte vald").',
+    'Rättat: skivor som ligger i "Att granska" efter snabbskanning visas inte längre som nya i butiksläget.',
+    'Rättat: butikens pris som du skrivit in ligger kvar när du byter utgåva eller trycker Köpt.',
+    'Rättat: stänger du butiksläget mitt i en sökning fastnar inte skanna-knappen längre.',
+    'Rättat: ett tillfälligt fel hos Discogs kunde ta bort en skivas prisförslag (och värde) i en vecka.' ] },
   { d: '2026-11-20', t: 'Butiksläge: Har jag den?', i: [
     'Ny: 🛒 "Har jag den?" under +. Skanna en skiva i butiken eller på loppis utan att lägga till den. Appen säger om du har den (eller albumet i en annan utgåva), om den står på önskelistan eller om den är ny.',
     'Butiksläget visar lägsta pris och prisförslag på Discogs för just den utgåvan. Skriv in butikens pris så ser du direkt om det är billigt eller dyrt.',
@@ -2069,14 +2077,17 @@ async function searchBarcode(code, onWait = () => {}) {
 /* ---------------- Butiksläge: "Har jag den?" ----------------
    Skanna en streckkod i skivaffären eller på loppis utan att lägga till skivan. Appen svarar om du har den,
    om den står på önskelistan eller om den är ny, och visar Discogs priser att jämföra med prislappen. */
-const shop = { cands: [], i: 0, code: '', market: new Map(), busy: false };
+const shop = { cands: [], i: 0, code: '', market: new Map(), busy: false, seq: 0, price: '' };
 const shopOpen = () => $('#shopSheet').classList.contains('open');
-const closeShop = () => $('#shopSheet').classList.remove('open');
+// Varje öppning/stängning får ett nytt löpnummer, så att en sökning som fortfarande väntar (t.ex. på
+// Discogs vid för många anrop) inte ritar över vyn eller spärrar skanna-knappen när man öppnar igen.
+function closeShop() { shop.seq++; shop.busy = false; $('#shopSheet').classList.remove('open'); }
 const canScanNative = () => nativeVer() >= 3;
 function openShop() {
   if (!cfg.discogs) { toast('Lägg in din Discogs-token under ⚙︎ först.'); return; }
   pendingQueueId = null;
-  shop.cands = []; shop.i = 0; shop.code = '';
+  shop.seq++; shop.busy = false;
+  shop.cands = []; shop.i = 0; shop.code = ''; shop.price = '';
   $('#shopSheet').classList.add('open');
   shopDraw();
   if (canScanNative()) shopScan();
@@ -2091,6 +2102,8 @@ const shopScanBtns = () => `
 function shopDraw(msg) {
   const c = shop.cands[shop.i];
   let html = `<div class="row"><h2 style="flex:1">Har jag den?</h2><button data-act="close">Stäng</button></div>`;
+  const queued = !c && shopQueued();   // syns direkt, även medan Discogs söks
+  if (queued) html += queuedVerdict(queued);
   if (msg) html += `<div class="msg">${msg}</div>`;
   else if (!c && !shop.code) html += `<p class="note">Skanna streckkoden på baksidan. Appen säger om du redan har skivan och vad den brukar kosta på Discogs. Inget läggs till förrän du trycker på en knapp.</p>`;
   else if (!c) html += `<div class="msg">Streckkod ${esc(shop.code)} finns inte i Discogs.<br>Prova att söka på artist och album i Lägg till i stället.</div>`;
@@ -2100,12 +2113,17 @@ function shopDraw(msg) {
   if (c) { shopMarket(c); shopCompare(); }
 }
 // Vad du redan har: samma utgåva (samma Discogs-post) eller samma album i en annan utgåva.
+// Samma utgåva: samma Discogs-post, eller ett album där du själv valt just den här utgåvan i detaljvyn.
+const ownsRelease = (r, c) => sameRec(r, c) || (r.dType === 'master' && !!r.relLabel && r.rid === c.dId);
 function shopMatches(c) {
-  const exact = recs.filter(r => sameRec(r, c));
+  const exact = recs.filter(r => ownsRelease(r, c));
   const album = c.masterId ? recs.filter(r => !exact.includes(r) && r.masterId === c.masterId) : [];
   return { exact, album };
 }
-const relDesc = r => r.dType === 'master' ? 'utgåva inte vald' : [r.year, r.format, r.country].filter(Boolean).join(', ') || 'annan utgåva';
+const relDesc = r => r.relLabel ? r.relLabel : r.dType === 'master' ? 'utgåva inte vald' : [r.year, r.format, r.country].filter(Boolean).join(', ') || 'annan utgåva';
+// Streckkoden ligger i "Att granska" (snabbskannad men inte klar): skivan finns alltså troligen hemma.
+const shopQueued = () => shop.code ? scanQueue.find(q => q.code === shop.code) : null;
+const queuedVerdict = q => `<div class="verdict have">✓ Ligger i "Att granska"<div class="m">Snabbskannad ${esc(today_(q.at))} men inte klar – öppna Lägg till för att välja utgåva.</div></div>`;
 const watchDesc = r => r.watch ? ` · bevakad under ${money(r.watch, 'SEK')}` : '';
 function shopHit(c) {
   const { exact, album } = shopMatches(c);
@@ -2116,6 +2134,8 @@ function shopHit(c) {
   else if (aHave.length) lines.push(['have', '✓ Du har albumet i en annan utgåva', aHave.slice(0, 3).map(r => esc(relDesc(r))).join('<br>')]);
   if (eWant) lines.push(['want', '♥ Står på din önskelista', esc(watchDesc(eWant).replace(/^ · /, ''))]);
   else if (aWant.length && !eHave) lines.push(['want', '♥ Albumet står på din önskelista', aWant.slice(0, 2).map(r => esc(relDesc(r) + watchDesc(r))).join('<br>')]);
+  const queued = shopQueued();
+  if (queued && !eHave) lines.unshift(['have', '✓ Ligger i "Att granska"', `Snabbskannad ${esc(today_(queued.at))} men inte klar – öppna Lägg till för att välja utgåva.`]);
   if (!lines.length) lines.push(['new', 'Ny – den har du inte', '']);
   const meta = [c.year, c.format, c.label, c.country, c.catno].filter(Boolean).join(' · ');
   const alts = shop.cands.length > 1 ? `<h3 style="margin:16px 0 0;font-size:14px">Streckkoden passar ${shop.cands.length} utgåvor – tryck på rätt</h3>
@@ -2133,7 +2153,7 @@ function shopHit(c) {
       <div><div class="t">${esc(c.title)}</div><div class="m">${esc(c.artist)}</div><div class="m">${esc(meta)}</div></div></div>
     ${lines.map(([cls, big, small]) => `<div class="verdict ${cls}">${big}${small ? `<div class="m">${small}</div>` : ''}</div>`).join('')}
     <div id="shopMkt"></div>
-    <input id="shopPrice" type="number" inputmode="numeric" min="0" placeholder="Pris i butiken (kr) – jämför med Discogs" style="margin-top:10px">
+    <input id="shopPrice" type="number" inputmode="numeric" min="0" value="${esc(shop.price)}" placeholder="Pris i butiken (kr) – jämför med Discogs" style="margin-top:10px">
     <div class="cmp" id="shopCmp"></div>
     <div class="actions">${btns.join('')}
       <div class="split"><button data-act="dg">Visa på Discogs</button><button data-act="sellers">Till salu på Discogs</button></div>
@@ -2179,7 +2199,7 @@ function shopCompare() {
   el.innerHTML = parts.length ? parts.join(' · ') : '';
 }
 async function shopScan() {
-  if (shop.busy) return;
+  if (shop.busy) { toast('Söker fortfarande – vänta lite.'); return; }
   let code;
   try { code = await native(id => App.scanBarcode(id)); }
   catch (e) { if (e.message !== 'cancel') toast('Skannern: ' + e.message.replace(/^fail:/, ''), 4000); return; }
@@ -2187,25 +2207,31 @@ async function shopScan() {
 }
 async function shopPhoto(file) {
   if (!file) return;
+  const my = shop.seq;
   shopDraw('<span class="spin"></span>Letar efter streckkod…');
   const scan = await scanPhoto(file);
+  if (my !== shop.seq || !shopOpen()) return;
   if (scan.barcodes?.length) shopLookup(scan.barcodes[0]);
   else { shopDraw(); toast('Hittade ingen streckkod i fotot. Skriv siffrorna i stället.', 4000); }
 }
 async function shopLookup(raw) {
   const code = String(raw || '').replace(/\D/g, '');
-  if (!code || shop.busy) return;
-  shop.busy = true; shop.code = code; shop.cands = []; shop.i = 0;
+  if (!code) return;
+  if (shop.busy) { toast('Söker fortfarande – vänta lite.'); return; }
+  const my = ++shop.seq;   // en ny öppning eller sökning gör det här svaret inaktuellt
+  const stale = () => my !== shop.seq || !shopOpen();
+  shop.busy = true; shop.code = code; shop.cands = []; shop.i = 0; shop.price = '';
   shopDraw(`<span class="spin"></span>Söker streckkod ${esc(code)}…`);
   try {
-    const res = await searchBarcode(code, (msg, wait) => shopDraw(`<span class="spin"></span>${esc(msg)}<br><span class="m">Försöker igen om ${Math.round(wait / 1000)} s</span>`));
+    const res = await searchBarcode(code, (msg, wait) => { if (!stale()) shopDraw(`<span class="spin"></span>${esc(msg)}<br><span class="m">Försöker igen om ${Math.round(wait / 1000)} s</span>`); });
+    if (stale()) return;
     if (res.err) { shopDraw(`${esc(res.err.message)}<br><a href="#" data-act="retry">Försök igen</a>`); return; }
     // Utgåvor som redan finns i samlingen först, så att svaret på "har jag den?" syns direkt.
     shop.cands = res.cands.slice(0, 8);
     const own = shop.cands.findIndex(c => shopMatches(c).exact.length);
     shop.i = own >= 0 ? own : 0;
     shopDraw();
-  } finally { shop.busy = false; }
+  } finally { if (my === shop.seq) shop.busy = false; }
 }
 // Lägger till skivan med priset som redan hämtats (så att det inte hämtas en gång till).
 function shopAdd(status) {
@@ -2240,7 +2266,7 @@ $('#shopSheet').addEventListener('click', e => {
       const { exact, album } = shopMatches(c);
       const r = exact.find(x => x.status === 'want') || album.find(x => x.status === 'want'); if (!r) break;
       // Stod albumet på önskelistan (eller en annan utgåva): byt till utgåvan du faktiskt köpte.
-      if (!sameRec(r, c)) {
+      if (!ownsRelease(r, c)) {
         for (const k of ['dType', 'dId', 'masterId', 'year', 'format', 'label', 'country', 'catno']) r[k] = c[k];
         if (c.cover) { r.cover = c.cover; r.thumb = c.thumb; }
         delete r.rid; delete r.price; delete r.priceHist; delete r.relLabel;
@@ -2255,7 +2281,7 @@ $('#shopSheet').addEventListener('click', e => {
     case 'sellers': if (c) openUrl(`https://www.discogs.com/sell/release/${c.dId}?currency=SEK`); break;
   }
 });
-$('#shopSheet').addEventListener('input', e => { if (e.target.id === 'shopPrice') shopCompare(); });
+$('#shopSheet').addEventListener('input', e => { if (e.target.id === 'shopPrice') { shop.price = e.target.value; shopCompare(); } });
 $('#shopSheet').addEventListener('keydown', e => { if (e.target.id === 'shopCode' && e.key === 'Enter') { e.target.blur(); shopLookup(e.target.value); } });
 $('#shopSheet').addEventListener('change', e => { if (e.target.id === 'shopCam') { shopPhoto(e.target.files[0]); e.target.value = ''; } });
 $('#btnShop').onclick = openShop;
