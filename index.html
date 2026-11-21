@@ -227,6 +227,7 @@
     <button id="closeAdd">Stäng</button>
   </div>
   <div class="filters" id="aFilters">
+    <select id="aWhat" aria-label="Sök på"></select>
     <select id="aFmt" aria-label="Format och storlek"></select>
     <select id="aYear" aria-label="Album utgivna från"></select>
   </div>
@@ -1216,23 +1217,36 @@ const rank = m => [...m.values()].sort((a, b) => b.score - a.score).slice(0, 8);
 /* Textsökning med format- och årsfilter. Hämtar 50 åt gången och kan hämta fler ("Visa fler").
    Årsfiltret görs här i appen (Discogs kan inte filtrera på "från år"), därför hämtas fler sidor
    tills det finns tillräckligt många träffar efter filtret. */
-let textSearch = null;   // { q, type, page, pages, total } för sökningen som visas nu
+let textSearch = null;   // { q, field, type, page, pages, total } för sökningen som visas nu
+// Vad sökningen gäller. Discogs har egna fält för artist, skivtitel och låt; "Allt" söker fritt (q).
+// Väljs per sökning och sparas inte: öppnar man Lägg till på nytt börjar det på "Allt".
+const WHATS = [
+  { v: 'q', label: 'Sök på allt', ph: 'Sök artist eller album', short: '' },
+  { v: 'artist', label: 'Artist', ph: 'Sök artist', short: 'bara artist' },
+  { v: 'release_title', label: 'Skiva', ph: 'Sök skivans titel', short: 'bara skivtitel' },
+  { v: 'track', label: 'Låt', ph: 'Sök låttitel', short: 'bara låt' }];
+const curWhat = () => WHATS.find(w => w.v === $('#aWhat').value) || WHATS[0];
+function setWhat(v) {
+  $('#aWhat').value = v; const w = curWhat();
+  $('#aq').placeholder = w.ph; $('#aWhat').classList.toggle('on', w.v !== 'q');
+}
 const minYear = () => parseInt(cfg.aYear) || 0;
 // Träffar där Discogs saknar år visas alltid (annars försvann de helt). För album (master) är året
 // albumets första utgivningsår, inte pressningens.
 const yearOk = c => !minYear() || !c.year || c.year >= minYear();
 async function textPage(st) {
-  const j = await dg('/database/search', { q: st.q, type: st.type, per_page: 50, page: st.page, ...fmtP() });
+  const j = await dg('/database/search', { [st.field || 'q']: st.q, type: st.type, per_page: 50, page: st.page, ...fmtP() });
   st.pages = j.pagination?.pages || 1;
   st.total = j.pagination?.items || 0;
   return (j.results || []).map(toCand);
 }
 async function findFromText(q) {
-  const st = textSearch = { q, type: 'master', page: 1 };
+  const field = curWhat().v;
+  const st = textSearch = { q, field, type: 'master', page: 1 };
   let res = await textPage(st);
   // Få album (master): visa specifika utgåvor i stället.
   if (res.length < 3) {
-    const st2 = { q, type: 'release', page: 1 };
+    const st2 = { q, field, type: 'release', page: 1 };
     const rel = await textPage(st2);
     if (rel.length > res.length) { textSearch = st2; res = res.concat(rel); }
   }
@@ -1266,7 +1280,7 @@ function openAdd(def = 'have') {
   $('#addView').classList.add('open');
   $('#addStatus').innerHTML = `<p class="note">Bäst träff: fota baksidan så att streckkoden syns. Saknas streckkod frågar appen Gemini om omslaget${cfg.gemini ? ` (${gemCount()} anrop idag)` : ''}.</p>`;
   $('#addResults').innerHTML = '';
-  $('#aq').value = '';
+  $('#aq').value = ''; setWhat('q');
   renderQueue();
   $('#btnBatch').hidden = !(window.App && App.scan);
 }
@@ -1301,7 +1315,7 @@ async function onPhoto(file) {
     busy('Letar efter streckkod…');
     const scan = await scanPhoto(file);
     const lines = byHeight((scan.lines || []).filter(l => norm(l.t).length > 1));
-    if (lines.length) $('#aq').value = lines.slice(0, 2).map(l => l.t).join(' ');
+    if (lines.length) setWhat('q'), $('#aq').value = lines.slice(0, 2).map(l => l.t).join(' ');
 
     // 1. Streckkod: gratis och nästan alltid exakt rätt.
     if (scan.barcodes?.length) {
@@ -1317,7 +1331,7 @@ async function onPhoto(file) {
         const info = await geminiIdentify(await toJpegBase64(file, 1024));
         const what = [info.artist, info.title].filter(Boolean).join(' – ');
         if (what) {
-          $('#aq').value = [info.artist, info.title].filter(Boolean).join(' ');
+          setWhat('q'); $('#aq').value = [info.artist, info.title].filter(Boolean).join(' ');
           busy(`Gemini tror "${what}". Söker i Discogs…`);
           const c = await findFromInfo(info);
           $('#addStatus').innerHTML = readBox(`Gemini: <b>${esc(what)}</b>${info.year ? ' (' + esc(info.year) + ')' : ''}${
@@ -1349,6 +1363,13 @@ async function runText(q) {
 }
 // Filtren i Lägg till: sparas, och gör om textsökningen om en sådan visas.
 const YEARS = [0, 1960, 1970, 1980, 1990, 2000, 2010, 2020];
+$('#aWhat').innerHTML = WHATS.map(w => `<option value="${w.v}">${esc(w.label)}</option>`).join('');
+setWhat('q');
+// Byter man vad man söker på görs sökningen om direkt (med texten i sökfältet).
+$('#aWhat').onchange = () => {
+  setWhat($('#aWhat').value);
+  const q = $('#aq').value.trim(); if (q) runText(q);
+};
 $('#aFmt').innerHTML = FMTS.map(f => `<option value="${f.v}">${esc(f.label)}</option>`).join('');
 $('#aYear').innerHTML = YEARS.map(y => `<option value="${y || ''}">${y ? 'Album från ' + y : 'Alla år'}</option>`).join('');
 function syncAddFilters() {
@@ -1372,7 +1393,7 @@ function showCands(cands, fromText = false) {
   const st = textSearch;
   const more = st && st.page < st.pages
     ? `<div class="actions" style="margin:10px 0"><button id="aMore">Visa fler</button></div>` : '';
-  const filt = [curFmt().short, minYear() ? 'album från ' + minYear() : ''].filter(Boolean).join(', ');
+  const filt = [curWhat().short, curFmt().short, minYear() ? 'album från ' + minYear() : ''].filter(Boolean).join(', ');
   if (!cands.length) {
     $('#addResults').innerHTML = `<div class="msg">Ingen träff i Discogs${filt ? ` (${filt})` : ''}. ${filt ? 'Prova att ändra filtret ovanför, eller' : 'Prova att'} skriva artist och album i sökfältet.</div>` + more;
     return;
@@ -1721,6 +1742,9 @@ $('#btnImport').onclick = () => {
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
 const WEB_VERSION = '2026-11-21';
 const CHANGELOG = [
+  { d: '2026-11-21', t: 'Välj vad du söker på', i: [
+    'Ny: i Lägg till kan du välja om sökningen gäller allt, bara artist, bara skivans titel eller en låt. Söker du på artisten "Kent" slipper du skivor som bara har ordet i titeln.',
+    'Valet börjar om på "Sök på allt" varje gång du öppnar Lägg till.' ] },
   { d: '2026-11-21', t: 'Filtrera på skivstorlek', i: [
     'Ny: formatfiltret i Lägg till har fått storlekar: LP (album), 12", 10" och 7" (singlar). Välj LP för att slippa singlar när du söker på en artist.',
     'Filtret gäller textsökningar och fotade skivor utan streckkod. Streckkoder ger alltid exakt utgåva och filtreras inte.' ] },
@@ -2339,7 +2363,7 @@ $('#queueBox').addEventListener('click', e => {
     // Köposten ligger kvar tills en skiva faktiskt läggs till från sökningen (se addRecFromCand).
     const q = scanQueue[+b.dataset.search]; if (!q) return;
     pendingQueueId = q.id;
-    $('#aq').value = ''; $('#aq').focus(); toast('Skriv artist och album och tryck sök'); return;
+    $('#aq').value = ''; setWhat('q'); $('#aq').focus(); toast('Skriv artist och album och tryck sök'); return;
   }
   const q = scanQueue[+b.dataset.q]; if (!q) return;
   const c = q.cands[+b.dataset.c];
