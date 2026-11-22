@@ -1403,7 +1403,13 @@ function fail(e) { $('#addStatus').innerHTML = `<div class="msg">${esc(e.message
 // Varje foto (och varje textsökning) får ett löpnummer. Ett svar som kommer efter att man fotat en ny skiva
 // eller sökt med text ritas inte ut; annars kunde träffarna för förra skivan skriva över den nya.
 let photoSeq = 0;
-const readBox = html => `<div class="read">${html}<br><span class="m">Blev det fel? Rätta texten i sökfältet och tryck sök.</span></div>`;
+// Sökrutan fylls inte med det som lästes av fotot (det blev ofta skräptext). Vill man söka på det finns en knapp.
+const readBox = (html, q = '') => `<div class="read">${html}<br><span class="m">Fel skiva? Skriv artist och album i sökfältet${
+  q ? ` eller <button data-sq="${esc(q)}" style="padding:4px 10px">Sök på "${esc(q.length > 40 ? q.slice(0, 40) + '…' : q)}"</button>` : ''}.</span></div>`;
+$('#addStatus').addEventListener('click', e => {
+  const b = e.target.closest('button[data-sq]'); if (!b) return;
+  setWhat('q'); $('#aq').value = b.dataset.sq; runText(b.dataset.sq);
+});
 async function onPhoto(file) {
   if (!file) return;
   const seq = ++photoSeq;
@@ -1415,13 +1421,13 @@ async function onPhoto(file) {
     file = new Blob([await file.arrayBuffer()], { type: file.type || 'image/jpeg' });
     const res = await identifyPhoto(file, t => live() && busy(t));
     if (!live()) return;
-    if (res.q) { setWhat('q'); $('#aq').value = res.q; }
     if (res.err) {
       // Discogs gick inte att nå: lägg skivan i "Att granska" så att den kan sökas igen senare.
       queuePhoto(res, await photoThumb(file), true); renderQueue();
       throw new Error(res.err.message + ' Skivan ligger i "Att granska" – tryck "Sök igen" senare.');
     }
     if (!res.cands.length) {
+      if (res.q) { setWhat('q'); $('#aq').value = res.q; }   // ingen träff: lägg det lästa i sökrutan att rätta
       throw new Error((res.gemErr ? res.gemErr + ' ' : '') + (res.q
         ? 'Hittade ingen träff i Discogs. Rätta texten i sökfältet och tryck sök.'
         : 'Hittade ingen streckkod eller text. Prova att fota baksidan med streckkoden, eller sök med text.'));
@@ -1431,7 +1437,7 @@ async function onPhoto(file) {
       res.how === 'barcode' ? `Streckkod <b>${esc(res.code)}</b>`
       : res.how === 'gemini' ? `Gemini: <b>${esc([info.artist, info.title].filter(Boolean).join(' – '))}</b>${info.year ? ' (' + esc(info.year) + ')' : ''}${
           info.confidence === 'low' ? ' <span class="m">· osäker</span>' : ''}<br><span class="m">${gemCount()} Gemini-anrop idag</span>`
-      : `${res.gemErr ? esc(res.gemErr) + '<br>' : ''}Läste texten: <b>${esc(res.q)}</b>`);
+      : `${res.gemErr ? esc(res.gemErr) + '<br>' : ''}Läste texten: <b>${esc(res.q)}</b>`, res.how === 'barcode' ? '' : res.q);
     showCands(res.cands);
   } catch (e) { if (live()) fail(e); }
 }
@@ -1839,6 +1845,7 @@ const CHANGELOG = [
     '"Att granska" visar en liten bild av fotot och Geminis gissning, så att du ser vilken skiva det var. "Sök med text" söker direkt på gissningen.',
     'Tydlig text på omslaget räcker nu utan Gemini, så att gratisanropen räcker till fler skivor.',
     'Streckkoden läses i högre upplösning, så att den hittas även när hela baksidan är med på fotot.',
+    'Sökrutan fylls inte längre med texten från fotot. Hittas ingen skiva läggs texten där så att du kan rätta den; annars finns en knapp "Sök på …".',
     'Rättat: fotade du en ny skiva innan förra var klar kunde träffarna för fel skiva visas.',
     'Rättat: när Discogs har "för många sökningar" väntar fotot och försöker igen i stället för att visa ett fel. Går det ändå inte hamnar skivan i "Att granska".',
     'Snabbskanningen säger "Fanns redan" om du har något av albumen streckkoden kan vara, och lägger inte samma okända streckkod i "Att granska" två gånger.' ] },
