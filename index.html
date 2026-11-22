@@ -133,6 +133,8 @@
   .qhead{margin:16px 0 4px;font-weight:700}
   .qitem{border:1px solid var(--line);border-radius:12px;padding:10px;margin:8px 0}
   .qitem .cand:last-of-type{border-bottom:0}
+  .qtop{display:flex;gap:10px;align-items:center}
+  .qimg{width:56px;height:56px;object-fit:cover;border-radius:6px;flex:none}
   .scanbox{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin:8px 0;text-align:center}
   .scanbox .big{font-size:17px;font-weight:700;margin:6px 0}
   .log h3{margin:18px 0 2px;font-size:16px}
@@ -236,7 +238,19 @@
     <label>🖼 Välj bild<input id="picInput" type="file" accept="image/*"></label>
   </div>
   <button id="btnBatch" class="batch">⚡ Snabbskanna många skivor (streckkoder)</button>
+  <button id="btnCovers" class="batch">📸 Fota många skivor (omslag och streckkoder)</button>
   <button id="btnShop" class="batch">🛒 Har jag den? Kolla en skiva i butiken</button>
+  <!-- Snabbläget för foton. Kamerans knapp ritas aldrig om (en ny input medan kameran är öppen tappar fotot);
+       bara #covStats och #covNow uppdateras. -->
+  <div id="coverMode" class="scanbox" hidden>
+    <div class="m" id="covStats"></div>
+    <div class="big" id="covNow"></div>
+    <div class="m" id="covSmall"></div>
+    <div class="shoot" style="grid-template-columns:2fr 1fr;margin-top:10px">
+      <label class="big" id="covShoot">📷 Fota nästa skiva<input id="covInput" type="file" accept="image/*" capture="environment"></label>
+      <label id="covDone">Klar</label>
+    </div>
+  </div>
   <div id="addStatus"></div>
   <div id="addResults"></div>
   <div id="queueBox"></div>
@@ -1104,6 +1118,10 @@ async function toJpegBase64(file, max = 2000) {
   c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
   return c.toDataURL('image/jpeg', 0.9).split(',')[1];
 }
+// Liten bild av fotot för "Att granska", så att man ser vilken skiva det var (några kB i localStorage).
+async function photoThumb(file) {
+  try { return 'data:image/jpeg;base64,' + await toJpegBase64(file, 128); } catch { return ''; }
+}
 let cbSeq = 0; const cbs = {};
 window.__cb = (id, ok, data) => { const c = cbs[id]; if (!c) return; delete cbs[id]; ok ? c.res(data) : c.rej(new Error(data)); };
 function nativeScan(b64) {
@@ -1112,7 +1130,8 @@ function nativeScan(b64) {
 // Android-appen läser streckkod och text med Googles ML Kit, i telefonen och utan kostnad.
 async function scanPhoto(file) {
   try {
-    if (window.App && App.scan) return await nativeScan(await toJpegBase64(file));
+    // 3000 px: streckkoden på baksidan av en hel LP är liten, och vid 2000 px blev strecken för smala för ML Kit.
+    if (window.App && App.scan) return await nativeScan(await toJpegBase64(file, 3000));
     if ('BarcodeDetector' in window) {   // vanlig webbläsare: bara streckkod
       const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
       const codes = await new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e'] }).detect(bmp);
@@ -1175,7 +1194,7 @@ async function findFromInfo(info) {
   const q = [info.artist, info.title].filter(Boolean).join(' ');
   if (q) tries.push({ q, type: 'master' }, { q, type: 'release' });
   for (const p of tries) {
-    const res = await dgSearch({ ...fmtP(), ...p });
+    const res = await dgSearchR({ ...fmtP(), ...p });
     if (res.length) return res.map(toCand);
   }
   return [];
@@ -1194,12 +1213,12 @@ async function findFromScan(scan) {
     seen.set(c.dId, { ...c, score: hit + bonus });
   });
   // 1. Streckkod ger nästan alltid exakt rätt utgåva.
-  for (const code of scan.barcodes || []) add(await dgSearch({ barcode: code.replace(/\D/g, ''), type: 'release' }), 2);
+  for (const code of scan.barcodes || []) add(await dgSearchR({ barcode: code.replace(/\D/g, ''), type: 'release' }), 2);
   if (seen.size) return rank(seen);
   // 2. Katalognummer, t.ex. "SKL 5251".
   const lines = (scan.lines || []).filter(l => norm(l.t).length > 1);
   const cat = lines.map(l => l.t.match(CATNO)).find(Boolean);
-  if (cat) add(await dgSearch({ catno: cat[1], type: 'release', ...fmtP() }), 0.3);
+  if (cat) add(await dgSearchR({ catno: cat[1], type: 'release', ...fmtP() }), 0.3);
   // 3. Den största texten är oftast artist och titel.
   const big = byHeight(lines).slice(0, 3).map(l => l.t);
   const qs = [];
@@ -1208,12 +1227,84 @@ async function findFromScan(scan) {
   if (big.length) qs.push(big[0]);
   for (const q of qs.slice(0, 3)) {
     if (best() >= 0.99) break;
-    add(await dgSearch({ q, type: 'master', per_page: 8, ...fmtP() }));
+    add(await dgSearchR({ q, type: 'master', per_page: 8, ...fmtP() }));
   }
-  if (best() < 0.5 && qs[0]) add(await dgSearch({ q: qs[0], type: 'release', per_page: 8, ...fmtP() }));
+  if (best() < 0.5 && qs[0]) add(await dgSearchR({ q: qs[0], type: 'release', per_page: 8, ...fmtP() }));
   return rank(seen);
 }
 const rank = m => [...m.values()].sort((a, b) => b.score - a.score).slice(0, 8);
+// Sökning för fotade skivor: försöker igen vid "för många sökningar" eller fel hos Discogs (dgSlot väntar
+// in spärren själv). Nätfel försöks inte igen; då går det ändå inte.
+async function dgSearchR(p) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await dgSearch(p); }
+    catch (e) {
+      if (!(e.status === 429 || e.status >= 500) || attempt >= 2) throw e;
+      await sleepMs(e.status === 429 ? 1000 : 3000);
+    }
+  }
+}
+const toks = s => norm(s).split(' ').filter(w => w.length > 1 && w !== 'the');   // "The Beatles" = "Beatles"
+const albumKey = c => c.masterId || 'r' + c.dId;
+// Hur väl en träff stämmer med artist och titel (0–1, båda hållen: inga ord för mycket eller för lite).
+function infoMatch(c, info) {
+  const want = new Set(toks(info.artist + ' ' + info.title)), got = toks(c.artist + ' ' + c.title);
+  if (!want.size || !got.length) return 0;
+  return Math.min(got.filter(w => want.has(w)).length / got.length, [...want].filter(w => got.includes(w)).length / want.size);
+}
+// Säker träff: den bästa träffen klarar testet och ingen träff från ett annat album gör det.
+function sureHit(cands, ok) {
+  const top = cands[0];
+  return !!top && ok(top) && !cands.some(c => albumKey(c) !== albumKey(top) && ok(c));
+}
+/* Känner igen skivan på ett foto. note(text) visar vad som händer. Ger
+   { how: 'barcode'|'text'|'gemini'|'', code, cands, sure, info, q, gemErr, err }
+   sure = så säker att snabbläget kan lägga in skivan utan att fråga. err = Discogs gick inte att nå. */
+async function identifyPhoto(file, note = () => {}) {
+  const out = { how: '', code: '', cands: [], sure: false, info: null, q: '', gemErr: '', err: null };
+  note('Letar efter streckkod…');
+  const scan = await scanPhoto(file);
+  const lines = byHeight((scan.lines || []).filter(l => norm(l.t).length > 1));
+  out.q = lines.slice(0, 2).map(l => l.t).join(' ');
+  try {
+    // 1. Streckkod: gratis och nästan alltid exakt rätt.
+    for (const raw of scan.barcodes || []) {
+      const code = raw.replace(/\D/g, ''); if (!code) continue;
+      out.code = out.code || code;
+      note('Streckkod hittad. Söker i Discogs…');
+      const c = (await dgSearchR({ barcode: code, type: 'release' })).map(toCand);
+      if (c.length) return { ...out, how: 'barcode', code, cands: c, sure: new Set(c.map(albumKey)).size === 1 };
+    }
+    // 2. Texten på omslaget, om den största texten tydligt är artist och titel. Sparar Gemini-anrop.
+    let textCands = [];
+    if (lines.length) {
+      note('Läser texten på omslaget…');
+      textCands = await findFromScan({ barcodes: [], lines: scan.lines });
+      // Alla ord i träffens artist och titel ska finnas bland de tre största textraderna (inte bara någonstans,
+      // för på baksidan står andra skivors och låtars namn i låtlistan).
+      const big = new Set(toks(lines.slice(0, 3).map(l => l.t).join(' ')));
+      const inBig = c => { const t = toks(c.artist + ' ' + c.title); return t.length > 0 && t.every(w => big.has(w)); };
+      if (sureHit(textCands, inBig)) return { ...out, how: 'text', cands: textCands, sure: true };
+    }
+    // 3. Gemini känner igen omslaget.
+    if (cfg.gemini) {
+      try {
+        note('Frågar Gemini om omslaget…');
+        const info = await geminiIdentify(await toJpegBase64(file, 1024));
+        if (info.artist || info.title) {
+          out.info = info; out.q = [info.artist, info.title].filter(Boolean).join(' ');
+          note(`Gemini tror "${[info.artist, info.title].filter(Boolean).join(' – ')}". Söker i Discogs…`);
+          const c = await findFromInfo(info);
+          if (c.length) return { ...out, how: 'gemini', cands: c,
+            sure: info.confidence === 'high' && sureHit(c, x => infoMatch(x, info) >= 0.99) };
+        }
+      } catch (e) { if (e.status || e.net) throw e; out.gemErr = e.message; }   // Discogs-fel hanteras nedan
+    }
+    // 4. Det texten gav, utan att vara säker.
+    if (textCands.length) return { ...out, how: 'text', cands: textCands };
+  } catch (e) { out.err = e; }
+  return out;
+}
 /* Textsökning med format- och årsfilter. Hämtar 50 åt gången och kan hämta fler ("Visa fler").
    Årsfiltret görs här i appen (Discogs kan inte filtrera på "från år"), därför hämtas fler sidor
    tills det finns tillräckligt många träffar efter filtret. */
@@ -1275,7 +1366,7 @@ let addedNow = new Map();
 let addSession = [];   // id för alla skivor som lagts till sedan vyn öppnades (även från tidigare sökningar)
 let pendingQueueId = null;   // köposten man tryckt "Sök med text" på
 function openAdd(def = 'have') {
-  addDefault = def; pendingQueueId = null; textSearch = null; syncAddFilters();
+  addDefault = def; pendingQueueId = null; textSearch = null; photoSeq++; syncAddFilters();
   addedNow = new Map(); addSession = []; updateAddDone();
   $('#addView').classList.add('open');
   $('#addStatus').innerHTML = `<p class="note">Bäst träff: fota baksidan så att streckkoden syns. Saknas streckkod frågar appen Gemini om omslaget${cfg.gemini ? ` (${gemCount()} anrop idag)` : ''}.</p>`;
@@ -1283,9 +1374,12 @@ function openAdd(def = 'have') {
   $('#aq').value = ''; setWhat('q');
   renderQueue();
   $('#btnBatch').hidden = !(window.App && App.scan);
+  drawCov();
 }
 function closeAdd() {
-  $('#addView').classList.remove('open'); pendingQueueId = null;
+  $('#addView').classList.remove('open'); pendingQueueId = null; photoSeq++;
+  // Snabbläget för foton avslutas, men foton som redan tagits bearbetas klart i bakgrunden.
+  if (cov.active) { cov.active = false; LS.set('sh.covmode', false); }
   // Visa den senast tillagda skivan i backen.
   const ids = addSession.filter(id => recs.some(r => r.id === id));
   addedNow = new Map(); addSession = []; updateAddDone();
@@ -1306,47 +1400,40 @@ $('#closeAdd').onclick = closeAdd;
 function busy(t) { $('#addStatus').innerHTML = `<div class="msg"><span class="spin"></span>${esc(t)}</div>`; }
 function fail(e) { $('#addStatus').innerHTML = `<div class="msg">${esc(e.message || e)}</div>`; }
 
+// Varje foto (och varje textsökning) får ett löpnummer. Ett svar som kommer efter att man fotat en ny skiva
+// eller sökt med text ritas inte ut; annars kunde träffarna för förra skivan skriva över den nya.
+let photoSeq = 0;
+const readBox = html => `<div class="read">${html}<br><span class="m">Blev det fel? Rätta texten i sökfältet och tryck sök.</span></div>`;
 async function onPhoto(file) {
   if (!file) return;
+  const seq = ++photoSeq;
+  const live = () => seq === photoSeq && $('#addView').classList.contains('open');
   pendingQueueId = null;   // ett foto är en ny skiva, inte den köpost man tryckt "Sök med text" på
   $('#addResults').innerHTML = '';
-  const readBox = html => `<div class="read">${html}<br><span class="m">Blev det fel? Rätta texten i sökfältet och tryck sök.</span></div>`;
   try {
-    busy('Letar efter streckkod…');
-    const scan = await scanPhoto(file);
-    const lines = byHeight((scan.lines || []).filter(l => norm(l.t).length > 1));
-    if (lines.length) setWhat('q'), $('#aq').value = lines.slice(0, 2).map(l => l.t).join(' ');
-
-    // 1. Streckkod: gratis och nästan alltid exakt rätt.
-    if (scan.barcodes?.length) {
-      busy('Streckkod hittad. Söker i Discogs…');
-      const c = await findFromScan({ barcodes: scan.barcodes, lines: scan.lines });
-      if (c.length) { $('#addStatus').innerHTML = readBox(`Streckkod <b>${esc(scan.barcodes[0])}</b>`); return showCands(c); }
+    // Kopiera fotot direkt: Android-skalet raderar kamerans fil när nästa foto tas.
+    file = new Blob([await file.arrayBuffer()], { type: file.type || 'image/jpeg' });
+    const res = await identifyPhoto(file, t => live() && busy(t));
+    if (!live()) return;
+    if (res.q) { setWhat('q'); $('#aq').value = res.q; }
+    if (res.err) {
+      // Discogs gick inte att nå: lägg skivan i "Att granska" så att den kan sökas igen senare.
+      queuePhoto(res, await photoThumb(file), true); renderQueue();
+      throw new Error(res.err.message + ' Skivan ligger i "Att granska" – tryck "Sök igen" senare.');
     }
-    // 2. Gemini känner igen omslaget.
-    let gemErr = '';
-    if (cfg.gemini) {
-      try {
-        busy('Frågar Gemini om omslaget…');
-        const info = await geminiIdentify(await toJpegBase64(file, 1024));
-        const what = [info.artist, info.title].filter(Boolean).join(' – ');
-        if (what) {
-          setWhat('q'); $('#aq').value = [info.artist, info.title].filter(Boolean).join(' ');
-          busy(`Gemini tror "${what}". Söker i Discogs…`);
-          const c = await findFromInfo(info);
-          $('#addStatus').innerHTML = readBox(`Gemini: <b>${esc(what)}</b>${info.year ? ' (' + esc(info.year) + ')' : ''}${
-            info.confidence === 'low' ? ' <span class="m">· osäker</span>' : ''}<br><span class="m">${gemCount()} Gemini-anrop idag</span>`);
-          if (c.length) return showCands(c);
-        }
-      } catch (e) { gemErr = e.message; }
+    if (!res.cands.length) {
+      throw new Error((res.gemErr ? res.gemErr + ' ' : '') + (res.q
+        ? 'Hittade ingen träff i Discogs. Rätta texten i sökfältet och tryck sök.'
+        : 'Hittade ingen streckkod eller text. Prova att fota baksidan med streckkoden, eller sök med text.'));
     }
-    // 3. Texten på omslaget.
-    if (!lines.length) throw new Error((gemErr ? gemErr + ' ' : '') + 'Hittade ingen streckkod eller text. Prova att fota baksidan med streckkoden, eller sök med text.');
-    busy('Söker på texten i Discogs…');
-    const c = await findFromScan({ barcodes: [], lines: scan.lines });
-    $('#addStatus').innerHTML = readBox(`${gemErr ? esc(gemErr) + '<br>' : ''}Läste texten: <b>${esc(lines.slice(0, 3).map(l => l.t).join(' · '))}</b>`);
-    showCands(c);
-  } catch (e) { fail(e); }
+    const info = res.info;
+    $('#addStatus').innerHTML = readBox(
+      res.how === 'barcode' ? `Streckkod <b>${esc(res.code)}</b>`
+      : res.how === 'gemini' ? `Gemini: <b>${esc([info.artist, info.title].filter(Boolean).join(' – '))}</b>${info.year ? ' (' + esc(info.year) + ')' : ''}${
+          info.confidence === 'low' ? ' <span class="m">· osäker</span>' : ''}<br><span class="m">${gemCount()} Gemini-anrop idag</span>`
+      : `${res.gemErr ? esc(res.gemErr) + '<br>' : ''}Läste texten: <b>${esc(res.q)}</b>`);
+    showCands(res.cands);
+  } catch (e) { if (live()) fail(e); }
 }
 $('#camInput').onchange = e => { onPhoto(e.target.files[0]); e.target.value = ''; };
 $('#picInput').onchange = e => { onPhoto(e.target.files[0]); e.target.value = ''; };
@@ -1358,8 +1445,13 @@ $('#aq').addEventListener('keydown', async e => {
   runText(q);
 });
 async function runText(q) {
-  try { busy('Söker…'); $('#addResults').innerHTML = ''; const c = await findFromText(q); $('#addStatus').innerHTML = ''; showCands(c, true); }
-  catch (err) { fail(err); }
+  const seq = ++photoSeq;   // en textsökning ersätter ett foto som fortfarande söks (och en äldre textsökning)
+  try {
+    busy('Söker…'); $('#addResults').innerHTML = '';
+    const c = await findFromText(q);
+    if (seq !== photoSeq) return;
+    $('#addStatus').innerHTML = ''; showCands(c, true);
+  } catch (err) { if (seq === photoSeq) fail(err); }
 }
 // Filtren i Lägg till: sparas, och gör om textsökningen om en sådan visas.
 const YEARS = [0, 1960, 1970, 1980, 1990, 2000, 2010, 2020];
@@ -1740,8 +1832,16 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-21';
+const WEB_VERSION = '2026-11-22';
 const CHANGELOG = [
+  { d: '2026-11-22', t: 'Fota många skivor i rad', i: [
+    'Ny: 📸 "Fota många skivor" under +. Fota skiva efter skiva, framsida eller baksida. Fotona bearbetas i bakgrunden medan du fotar nästa. Säkra träffar läggs in direkt, resten hamnar i "Att granska".',
+    '"Att granska" visar en liten bild av fotot och Geminis gissning, så att du ser vilken skiva det var. "Sök med text" söker direkt på gissningen.',
+    'Tydlig text på omslaget räcker nu utan Gemini, så att gratisanropen räcker till fler skivor.',
+    'Streckkoden läses i högre upplösning, så att den hittas även när hela baksidan är med på fotot.',
+    'Rättat: fotade du en ny skiva innan förra var klar kunde träffarna för fel skiva visas.',
+    'Rättat: när Discogs har "för många sökningar" väntar fotot och försöker igen i stället för att visa ett fel. Går det ändå inte hamnar skivan i "Att granska".',
+    'Snabbskanningen säger "Fanns redan" om du har något av albumen streckkoden kan vara, och lägger inte samma okända streckkod i "Att granska" två gånger.' ] },
   { d: '2026-11-21', t: 'Välj vad du söker på', i: [
     'Ny: i Lägg till kan du välja om sökningen gäller allt, bara artist, bara skivans titel eller en låt. Söker du på artisten "Kent" slipper du skivor som bara har ordet i titeln.',
     'Valet börjar om på "Sök på allt" varje gång du öppnar Lägg till.' ] },
@@ -1953,8 +2053,11 @@ function mergeBackup(data) {
       if (!artistInfo[name] && v && typeof v === 'object') artistInfo[name] = { person: !!v.person, ...(num(v.id) ? { id: num(v.id) } : {}) };
   if (Array.isArray(data.queue)) for (const q of data.queue) {
     if (!q || !ID_RE.test(q.id) || deleted[q.id] || scanQueue.some(x => x.id === q.id)) continue;
+    const img = typeof q.img === 'string' && q.img.length < 30000 && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(q.img) ? q.img : '';
+    const g = q.guess && typeof q.guess === 'object' ? { artist: str(q.guess.artist, 120), title: str(q.guess.title, 120) } : null;
     scanQueue.push({ id: q.id, code: str(q.code, 20).replace(/\D/g, ''), at: num(q.at) || Date.now(),
-      cands: Array.isArray(q.cands) ? q.cands.map(cleanCand).filter(Boolean).slice(0, 5) : [], ...(q.retry ? { retry: true } : {}) });
+      cands: Array.isArray(q.cands) ? q.cands.map(cleanCand).filter(Boolean).slice(0, 5) : [], ...(q.retry ? { retry: true } : {}),
+      ...(img ? { img } : {}), ...(q.q ? { q: str(q.q, 120) } : {}), ...(g && (g.artist || g.title) ? { guess: g } : {}) });
   }
   if (Array.isArray(data.missHide)) {
     const h = new Set(LS.get('sh.missHide', []));
@@ -2028,15 +2131,16 @@ $('#bkAuto').onchange = e => { cfg.bkAuto = e.target.checked; saveCfg(); if (cfg
 $('#btnLog').onclick = openLog;
 
 /* ---------------- Snabbskanning av många skivor ---------------- */
-function addRecFromCand(c, status) {
+function addRecFromCand(c, status, auto = false) {
   const rec = { id: uid(), status, added: Date.now(), ...c };
   delete rec.score;
   recs.push(rec); saveRecs();
   // Alla skivor som läggs till medan Lägg till-vyn är öppen (sökning, kön, snabbskanning) räknas i
   // "Klar (n)" och visas i backen när vyn stängs.
   if ($('#addView').classList.contains('open')) { addSession.push(rec.id); updateAddDone(); }
-  // Kom skivan från "Sök med text" för en köpost tas köposten bort först nu.
-  if (pendingQueueId) {
+  // Kom skivan från "Sök med text" för en köpost tas köposten bort först nu. (Inte när snabbläget lägger in
+  // en skiva i bakgrunden medan man söker för en köpost.)
+  if (pendingQueueId && !auto) {
     const qi = scanQueue.findIndex(q => q.id === pendingQueueId);
     pendingQueueId = null;
     if (qi >= 0) { dropQueue(qi); renderQueue(); }
@@ -2081,8 +2185,10 @@ async function batchScan() {
         await sleep(1100); continue;
       }
       const masters = new Set(cands.map(c => c.masterId || 'r' + c.dId));
-      const ex = cands[0] && findExisting(cands[0]);
+      // Har du något av albumen som streckkoden kan vara är det troligen den skivan.
+      const ex = cands.map(findExisting).find(Boolean);
       if (ex) { st.dup++; box('Fanns redan: ' + esc(ex.title), esc(ex.artist)); }
+      else if (scanQueue.some(q => q.code === code)) { st.dup++; box('Ligger redan i "Att granska"', 'Streckkod ' + esc(code)); }
       else if (cands.length && masters.size === 1) {
         const rec = addRecFromCand(cands[0], 'have');
         st.added++; box('✓ ' + esc(rec.title), esc(rec.artist) + (rec.year ? ' · ' + rec.year : ''));
@@ -2111,6 +2217,107 @@ async function searchBarcode(code, onWait = () => {}) {
     }
   }
 }
+/* ---------------- Snabbläge för foton: många skivor i rad ----------------
+   Fota skiva efter skiva. Fotona bearbetas ett i taget i bakgrunden medan man fotar nästa. Säkra träffar
+   läggs in direkt, resten hamnar i "Att granska" med en liten bild av fotot. */
+const cov = { active: false, jobs: [], running: false, st: null, now: '', small: '' };
+const HOW = { barcode: 'streckkod', text: 'texten på omslaget', gemini: 'Gemini' };
+const covStatsText = st => `${st.shot} fotade · ${st.added} tillagda${st.dup ? ` · ${st.dup} fanns redan` : ''}${st.review ? ` · ${st.review} att granska` : ''}`;
+// Lägger ett foto i "Att granska". Ger false om streckkoden redan ligger där.
+function queuePhoto(res, img, retry = false) {
+  if (res.code && scanQueue.some(q => q.code === res.code)) return false;
+  const g = res.info && (res.info.artist || res.info.title) ? { artist: str(res.info.artist, 120), title: str(res.info.title, 120) } : null;
+  scanQueue.push({ id: uid(), code: res.code || '', at: Date.now(),
+    cands: retry ? [] : res.cands.slice(0, 5).map(({ score, ...c }) => c),
+    ...(img ? { img } : {}), ...(res.q ? { q: str(res.q, 120) } : {}), ...(g ? { guess: g } : {}), ...(retry ? { retry: true } : {}) });
+  saveQueue(); return true;
+}
+function drawCov() {
+  const pending = cov.jobs.length + (cov.running ? 1 : 0);
+  const show = cov.active || pending > 0;
+  $('#coverMode').hidden = !show;
+  $('#coverMode .shoot').hidden = !cov.active;
+  document.querySelector('.shoot').hidden = show;
+  $('#btnCovers').hidden = show; $('#btnShop').hidden = show;
+  $('#btnBatch').hidden = show || !(window.App && App.scan);
+  if (!show) return;
+  $('#covStats').textContent = cov.st ? 'Fota många · ' + covStatsText(cov.st) : '';
+  $('#covNow').innerHTML = cov.now;
+  $('#covSmall').innerHTML = cov.small + (!cov.active && pending ? `<br>Bearbetar ${pending} foto${pending > 1 ? 'n' : ''} till…` : '');
+}
+function startCovers(openCam = true) {
+  if (batching) return;
+  if (!cfg.discogs) { toast('Lägg in din Discogs-token under ⚙︎ först.'); return; }
+  cov.active = true; LS.set('sh.covmode', true);
+  if (!cov.st || (!cov.running && !cov.jobs.length)) cov.st = { shot: 0, added: 0, dup: 0, review: 0 };
+  pendingQueueId = null; photoSeq++;
+  $('#addStatus').innerHTML = ''; $('#addResults').innerHTML = '';
+  if (!cov.running) {
+    cov.now = cov.st.shot ? 'Fota nästa skiva' : 'Fota första skivan';
+    cov.small = 'Framsida eller baksida. Säkra träffar läggs in direkt, resten hamnar i "Att granska".'
+      + (cfg.gemini ? '' : ' Utan Gemini-nyckel (⚙︎) känns bara streckkoder och tydlig text igen.');
+  }
+  drawCov();
+  if (openCam) $('#covInput').click();   // samma tryckning öppnar kameran direkt
+}
+async function enqueueCov(file) {
+  if (!cov.st) cov.st = { shot: 0, added: 0, dup: 0, review: 0 };
+  let blob;
+  // Kopiera fotot direkt: Android-skalet raderar kamerans fil när nästa foto tas.
+  try { blob = new Blob([await file.arrayBuffer()], { type: file.type || 'image/jpeg' }); }
+  catch { toast('Kunde inte läsa fotot. Ta det igen.', 4000); return; }
+  cov.st.shot++; cov.jobs.push(blob); drawCov(); runCov();
+}
+async function runCov() {
+  if (cov.running) return;
+  cov.running = true;
+  try {
+    while (cov.jobs.length) {
+      const file = cov.jobs.shift(), st = cov.st, n = st.shot - cov.jobs.length;
+      const note = t => {
+        cov.now = `<span class="spin"></span>${esc(t)}`;
+        cov.small = `Skiva ${n}${cov.jobs.length ? ` · ${cov.jobs.length} till väntar` : ''}`; drawCov();
+      };
+      let res;
+      try { res = await identifyPhoto(file, note); } catch (e) { res = { cands: [], code: '', q: '', err: e }; }
+      const img = await photoThumb(file);
+      if (res.err) {
+        queuePhoto(res, img, true); st.review++;
+        cov.now = 'Kunde inte söka just nu'; cov.small = 'Lagd i "Att granska" – tryck "Sök igen" senare';
+      } else if (res.sure) {
+        const ex = findExisting(res.cands[0]);
+        if (ex) { st.dup++; cov.now = 'Fanns redan: ' + esc(ex.title); cov.small = esc(ex.artist); }
+        else {
+          const rec = addRecFromCand(res.cands[0], 'have', true); st.added++;
+          cov.now = '✓ ' + esc(rec.title); cov.small = esc(rec.artist) + (rec.year ? ' · ' + rec.year : '') + ' · via ' + HOW[res.how];
+          render();
+        }
+      } else if (queuePhoto(res, img)) {
+        st.review++;
+        cov.now = res.cands.length ? 'Osäker – kolla i "Att granska"' : 'Hittade inte skivan';
+        cov.small = res.cands.length ? 'Välj rätt skiva där sen' : (res.gemErr ? esc(res.gemErr) + ' ' : '') + 'Lagd i "Att granska", sök med text sen';
+      } else { st.dup++; cov.now = 'Ligger redan i "Att granska"'; cov.small = 'Streckkod ' + esc(res.code); }
+      renderQueue(); drawCov();
+    }
+  } finally {
+    cov.running = false;
+    if (cov.active) { cov.small += '<br>Fota nästa skiva, eller tryck Klar.'; drawCov(); } else finishCov();
+    setTimeout(resolveArtists, 1500);
+  }
+}
+function finishCov() {
+  const st = cov.st; cov.st = null; drawCov();
+  if (st?.shot && $('#addView').classList.contains('open'))
+    $('#addStatus').innerHTML = `<div class="scanbox"><div class="big">Klart!</div><div class="m">${covStatsText(st)}</div></div>`;
+  render(); renderQueue();
+}
+$('#btnCovers').onclick = () => startCovers();
+$('#covInput').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) enqueueCov(f); };
+$('#covDone').onclick = () => {
+  cov.active = false; LS.set('sh.covmode', false);
+  if (!cov.running && !cov.jobs.length) finishCov(); else drawCov();
+};
+
 /* ---------------- Butiksläge: "Har jag den?" ----------------
    Skanna en streckkod i skivaffären eller på loppis utan att lägga till skivan. Appen svarar om du har den,
    om den står på önskelistan eller om den är ny, och visar Discogs priser att jämföra med prislappen. */
@@ -2325,19 +2532,32 @@ $('#btnShop').onclick = openShop;
 function renderQueue() {
   const el = $('#queueBox');
   if (!scanQueue.length) { el.innerHTML = ''; return; }
-  el.innerHTML = `<div class="qhead">Att granska (${scanQueue.length})</div>` + scanQueue.map((q, qi) => `
-    <div class="qitem">
-      <div class="m">Streckkod ${esc(q.code)}${q.cands.length ? ' · vilken är det?' : q.retry ? ' · kunde inte sökas' : ' · hittades inte i Discogs'}</div>
-      ${q.cands.map((c, ci) => `<div class="cand">
+  el.innerHTML = `<div class="qhead">Att granska (${scanQueue.length})</div>` + scanQueue.map((q, qi) => {
+    const what = q.code ? 'Streckkod ' + esc(q.code) : 'Fotad skiva';
+    const guess = q.guess ? ` · Gemini: ${esc([q.guess.artist, q.guess.title].filter(Boolean).join(' – '))}` : '';
+    const state = q.cands.length ? ' · vilken är det?' : q.retry ? ' · kunde inte sökas' : q.code ? ' · hittades inte i Discogs' : ' · hittades inte';
+    return `<div class="qitem">
+      <div class="qtop">${q.img ? `<img class="qimg" src="${esc(q.img)}" alt="">` : ''}<div class="m">${what}${guess}${state}</div></div>
+      ${q.cands.map((c, ci) => { const ex = findExisting(c); return `<div class="cand">
         ${c.thumb ? `<img src="${esc(c.thumb)}" alt="">` : '<div class="ph">♪</div>'}
         <div><div class="t">${esc(c.title)}</div><div class="m">${esc(c.artist)} · ${esc([c.year, c.format, c.country].filter(Boolean).join(' · '))}</div>
-          <div class="btns"><button data-q="${qi}" data-c="${ci}" data-s="have" class="on">Har den</button><button data-q="${qi}" data-c="${ci}" data-s="want">Vill ha</button></div></div></div>`).join('')}
+          ${ex ? `<div class="m">Finns redan under ${ex.status === 'have' ? 'Har' : 'Vill ha'}</div>` : ''}
+          <div class="btns"><button data-q="${qi}" data-c="${ci}" data-s="have" class="on">Har den</button><button data-q="${qi}" data-c="${ci}" data-s="want">Vill ha</button></div></div></div>`; }).join('')}
       <div class="btns" style="display:flex;gap:6px;margin-top:6px">
-        ${q.retry ? `<button data-retry="${qi}">Sök igen</button>` : ''}
-        ${q.cands.length ? '' : `<button data-search="${qi}">Sök med text</button>`}
+        ${q.retry && (q.code || q.guess || q.q) ? `<button data-retry="${qi}">Sök igen</button>` : ''}
+        <button data-search="${qi}">${q.cands.length ? 'Ingen av dem – sök' : 'Sök med text'}</button>
         <button data-del="${qi}">Ta bort</button>
       </div>
-    </div>`).join('');
+    </div>`; }).join('');
+}
+// "Sök igen" för en köpost: streckkoden, annars Geminis gissning eller texten på fotot.
+async function searchQueued(q) {
+  if (q.code) return searchBarcode(q.code);
+  try {
+    const c = q.guess ? await findFromInfo(q.guess)
+      : (await dgSearchR({ q: q.q, type: 'master', per_page: 8, ...fmtP() })).map(toCand);
+    return { cands: c };
+  } catch (e) { return { cands: [], err: e }; }
 }
 $('#queueBox').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
@@ -2346,12 +2566,12 @@ $('#queueBox').addEventListener('click', e => {
   if (b.dataset.retry != null) {
     const q = scanQueue[+b.dataset.retry]; if (!q) return;
     b.disabled = true; b.innerHTML = '<span class="spin"></span>Söker…';
-    searchBarcode(q.code).then(res => {
+    searchQueued(q).then(res => {
       if (res.err) { toast(res.err.message, 4000); renderQueue(); return; }
-      q.cands = res.cands.slice(0, 5); delete q.retry;
-      // Säker träff (ett enda album) läggs in direkt, som vid snabbskanningen.
+      q.cands = res.cands.slice(0, 5).map(({ score, ...c }) => c); delete q.retry;
+      // Säker träff (ett enda album, via streckkod) läggs in direkt, som vid snabbskanningen.
       const masters = new Set(res.cands.map(c => c.masterId || 'r' + c.dId));
-      if (res.cands.length && masters.size === 1 && !findExisting(res.cands[0])) {
+      if (q.code && res.cands.length && masters.size === 1 && !findExisting(res.cands[0])) {
         const rec = addRecFromCand(res.cands[0], 'have');
         dropQueue(scanQueue.indexOf(q)); render(); toast(`${rec.title} är tillagd`); setTimeout(resolveArtists, 1500);
       } else saveQueue();
@@ -2363,7 +2583,13 @@ $('#queueBox').addEventListener('click', e => {
     // Köposten ligger kvar tills en skiva faktiskt läggs till från sökningen (se addRecFromCand).
     const q = scanQueue[+b.dataset.search]; if (!q) return;
     pendingQueueId = q.id;
-    $('#aq').value = ''; setWhat('q'); $('#aq').focus(); toast('Skriv artist och album och tryck sök'); return;
+    setWhat('q');
+    // Finns en gissning eller text från fotot söks den direkt; annars får man skriva själv.
+    const pre = q.guess ? [q.guess.artist, q.guess.title].filter(Boolean).join(' ') : q.q || '';
+    $('#aq').value = pre;
+    if (pre) { runText(pre); $('#aq').scrollIntoView({ block: 'start', behavior: 'smooth' }); }
+    else { $('#aq').focus(); toast('Skriv artist och album och tryck sök'); }
+    return;
   }
   const q = scanQueue[+b.dataset.q]; if (!q) return;
   const c = q.cands[+b.dataset.c];
@@ -2604,15 +2830,18 @@ async function checkPending() {
     if (p.type === 'photo' && p.data) {
       const bin = atob(p.data), bytes = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      openAdd(addDefault);
+      const blob = new Blob([bytes], { type: 'image/jpeg' });
       toast('Fortsätter med fotot du tog');
-      onPhoto(new Blob([bytes], { type: 'image/jpeg' }));
+      // Var snabbläget igång fortsätter det där, annars som ett vanligt foto.
+      if (LS.get('sh.covmode', false)) { openAdd(addDefault); startCovers(false); enqueueCov(blob); }
+      else { openAdd(addDefault); onPhoto(blob); }
     } else if (p.type === 'save') {
       driveSave('save');
     } else if (p.type === 'load' && p.data) {
       toast(mergeMsg(mergeBackup(JSON.parse(p.data))), 4000);
       openSettings();
     } else if (p.type === 'error') toast(p.data, 4000);
+    if (p.type !== 'photo' && !cov.active) LS.set('sh.covmode', false);   // gammal markering från ett avbrutet snabbläge
   } catch (e) {
     console.log('pending', e);
     toast(e instanceof SyntaxError ? 'Filen ser inte ut som en backup från Skivbacken.' : e.message || 'Något gick fel.', 4000);
