@@ -48,6 +48,8 @@ import java.util.concurrent.Executors
  *  - att Spotify-inloggningen sker inne i appen så att svaret kommer tillbaka hit,
  *  - App.takePending(): foto/backup som blev kvar om Android stängde appen medan kameran eller filväljaren var öppen,
  *  - App.share(): telefonens dela-meny (t.ex. för önskelistan),
+ *  - App.capturePhoto(): kameran direkt, med fotot tillbaka som base64 (snabbläget fotar skiva efter skiva
+ *    utan att man behöver trycka mellan fotona),
  *  - att appen laddar om sidan i stället för att stängas om WebViews ritprocess kraschar.
  *
  * Bryggan App.* svarar bara när sidan som visas är webbappen (inte t.ex. Spotifys inloggningssidor).
@@ -60,6 +62,7 @@ class MainActivity : Activity() {
         const val REQ_FILE = 42
         const val REQ_SAVE = 43
         const val REQ_OPEN = 44
+        const val REQ_PHOTO = 45
         // Sidor som ska visas inne i appen (Spotify-inloggningen). Allt annat öppnas utanför.
         val INSIDE = setOf(HOST, "accounts.spotify.com", "challenge.spotify.com", "accounts.scdn.co")
     }
@@ -72,6 +75,10 @@ class MainActivity : Activity() {
     private var pendingSaveJson: String? = null
     private var pendingSaveId: String? = null
     private var pendingOpenId: String? = null
+    // App.capturePhoto: väntande anrop, största bildsida och filen kameran sparar i.
+    private var pendingPhotoId: String? = null
+    private var pendingPhotoMax = 3000
+    private var camUri: Uri? = null
     // Värd för sidan som visas just nu. Bryggan används bara när det är webbappen.
     @Volatile private var pageHost: String? = null
     private val barcodeScanner by lazy {
@@ -88,6 +95,7 @@ class MainActivity : Activity() {
         createWeb()
         // Fotot som kameran skulle spara, om appen stängts av Android medan kameran var öppen.
         savedInstanceState?.getString("photoUri")?.let { photoUri = Uri.parse(it) }
+        savedInstanceState?.getString("camUri")?.let { camUri = Uri.parse(it) }
         // restoreState ger null om det sparade tillståndet inte gick att återställa; ladda då sidan på nytt
         // i stället för att visa en vit skärm.
         if (savedInstanceState == null || web.restoreState(savedInstanceState) == null) loadStart()
@@ -114,7 +122,7 @@ class MainActivity : Activity() {
         fileCallback = null   // hörde till en WebView som inte finns längre; ett foto tas då emot via takePending
         // Samma sak för backupen: sidan som väntade på svaret finns inte längre (ritprocessen kraschade medan
         // filväljaren var öppen). Utan id går resultatet via setPending, som den nya sidan hämtar vid start.
-        pendingSaveId = null; pendingSaveJson = null; pendingOpenId = null
+        pendingSaveId = null; pendingSaveJson = null; pendingOpenId = null; pendingPhotoId = null
         web = WebView(this)
         setContentView(web)
         web.settings.javaScriptEnabled = true
@@ -193,6 +201,7 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_SAVE || requestCode == REQ_OPEN) { onBackupResult(requestCode, resultCode, data); return }
+        if (requestCode == REQ_PHOTO) { onCaptureResult(resultCode); return }
         if (requestCode != REQ_FILE) return
         val cb = fileCallback
         if (cb == null) {
@@ -215,6 +224,7 @@ class MainActivity : Activity() {
         super.onSaveInstanceState(outState)
         web.saveState(outState)
         photoUri?.let { outState.putString("photoUri", it.toString()) }
+        camUri?.let { outState.putString("camUri", it.toString()) }
     }
 
     /* ---------- Resultat som kommer efter att Android stängt och startat om appen ---------- */
@@ -224,15 +234,29 @@ class MainActivity : Activity() {
         web.evaluateJavascript("window.__checkPending && window.__checkPending()", null)
     }
 
-    /** Läser in fotot nedskalat (max 2000 px) och vänt rätt enligt EXIF, som JPEG i base64. */
-    private fun photoB64(uri: Uri): String {
+    /** Läser in fotot nedskalat (max [max] px) och vänt rätt enligt EXIF, som JPEG i base64. */
+    private fun photoB64(uri: Uri, max: Int = 2000): String {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        val big = maxOf(bounds.outWidth, bounds.outHeight)
+        // Största potensen av 2 som inte gör bilden mindre än max; resten skalas ner exakt nedan.
         var sample = 1
-        while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 2000) sample *= 2
-        val bmp = contentResolver.openInputStream(uri)?.use {
-            BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+        while (big / (sample * 2) >= max) sample *= 2
+        val decoded = try {
+            contentResolver.openInputStream(uri)?.use {
+                BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+            }
+        } catch (_: OutOfMemoryError) {
+            contentResolver.openInputStream(uri)?.use {
+                BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample * 2 })
+            }
         } ?: throw Exception("Kunde inte läsa fotot")
+        val dm = maxOf(decoded.width, decoded.height)
+        val bmp = if (dm > max) {
+            val k = max.toFloat() / dm
+            Bitmap.createScaledBitmap(decoded, (decoded.width * k).toInt(), (decoded.height * k).toInt(), true)
+                .also { if (it !== decoded) decoded.recycle() }
+        } else decoded
         val rot = try {
             contentResolver.openInputStream(uri)?.use {
                 when (ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
@@ -283,6 +307,37 @@ class MainActivity : Activity() {
             lines.put(JSONObject().put("t", line.text).put("h", line.boundingBox?.height() ?: 0))
         }
         return JSONObject().put("barcodes", barcodes).put("lines", lines).toString()
+    }
+
+    /* ---------- Kameran direkt (snabbläget för foton) ---------- */
+    private fun startCapture(id: String, max: Int) {
+        pendingPhotoId?.let { reply(it, false, "cancel") }
+        val dir = File(cacheDir, "camera").apply { mkdirs() }
+        dir.listFiles()?.forEach { it.delete() }
+        val file = File(dir, "skiva-${System.currentTimeMillis()}.jpg")
+        val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
+        camUri = uri; pendingPhotoId = id; pendingPhotoMax = max.coerceIn(800, 4000)
+        val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+            .putExtra(MediaStore.EXTRA_OUTPUT, uri)
+            .addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        try { startActivityForResult(intent, REQ_PHOTO) }
+        catch (e: Exception) { pendingPhotoId = null; camUri = null; reply(id, false, "Kunde inte öppna kameran") }
+    }
+    private fun onCaptureResult(resultCode: Int) {
+        val id = pendingPhotoId
+        val uri = camUri
+        pendingPhotoId = null; camUri = null
+        if (id == null) {
+            // Appen startades om medan kameran var öppen: lämna fotot till webbappen när den laddats.
+            if (resultCode == RESULT_OK && uri != null) setPending("photo", uri.toString())
+            return
+        }
+        if (resultCode != RESULT_OK || uri == null) { reply(id, false, "cancel"); return }
+        val max = pendingPhotoMax
+        worker.execute {
+            try { reply(id, true, photoB64(uri, max)) }
+            catch (e: Throwable) { reply(id, false, "Kunde inte läsa fotot: ${e.message ?: e.javaClass.simpleName}") }
+        }
     }
 
     /* ---------- Backup: en JSON-fil på valfri plats, t.ex. Google Drive ---------- */
@@ -368,7 +423,7 @@ class MainActivity : Activity() {
         // Bara webbappen får använda bryggan, inte andra sidor som visas i appen (t.ex. Spotifys inloggning).
         private fun trusted() = pageHost == HOST
 
-        @JavascriptInterface fun version(): String = if (trusted()) "5" else "0"
+        @JavascriptInterface fun version(): String = if (trusted()) "6" else "0"
 
         /** mode: "auto" = bara om en fil redan är vald, "save" = samma fil som förut (annars välj), "pick" = välj ny plats. */
         @JavascriptInterface fun saveBackup(json: String, id: String, mode: String) {
@@ -401,7 +456,7 @@ class MainActivity : Activity() {
                 try {
                     val uri = Uri.parse(uriStr)
                     when (type) {
-                        "photo" -> res.put("data", photoB64(uri))
+                        "photo" -> res.put("data", photoB64(uri, 3000))
                         "load" -> res.put("data", contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: "")
                         else -> res.put("data", "")
                     }
@@ -429,6 +484,10 @@ class MainActivity : Activity() {
                 try { reply(id, true, this@MainActivity.scan(b64)) }
                 catch (e: Exception) { reply(id, false, "Kunde inte läsa av bilden: ${e.message ?: e.javaClass.simpleName}") }
             }
+        }
+        /** Kameran (v6). Svarar med fotot som JPEG i base64 (längsta sida högst max px), "cancel" eller ett fel. */
+        @JavascriptInterface fun capturePhoto(id: String, max: Int) {
+            if (trusted()) runOnUiThread { startCapture(id, max) }
         }
         /** Öppnar telefonens dela-meny med en text (v5). */
         @JavascriptInterface fun share(text: String, title: String) {

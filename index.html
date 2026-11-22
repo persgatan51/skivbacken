@@ -855,7 +855,7 @@ function preload(url) {
   const im = new Image();
   im.src = url;
   imgCache.set(url, im.decode().catch(() => {}));
-  if (imgCache.size > 400) imgCache.delete(imgCache.keys().next().value);
+  if (imgCache.size > 150) imgCache.delete(imgCache.keys().next().value);   // färre avkodade bilder i minnet
 }
 function crateSet(list, emptyMsg) {
   const curId = crate.list[Math.round(crate.pos)]?.id;
@@ -897,6 +897,9 @@ function crateEl(i) {
   if (r.cover) {
     const img = new Image();
     img.alt = '';
+    // sync: annars ritar Chrome i Android stora bilder i två steg (först utan bilden, sedan med), och varje
+    // gång backen ritas om när man bläddrar blinkar omslaget till. Det var flimret.
+    img.decoding = 'sync';
     img.src = r.cover;
     // Tona bara in omslag som inte redan finns i cachen; annars blinkar de när ett element skapas på nytt.
     if (!img.complete) {
@@ -930,7 +933,7 @@ function crateDraw(force) {
     if (i == null || i < keepLo || i > keepHi) { el.remove(); crate.els.delete(id); }
     else if (i < lo || i > hi) { el.hidden = true; el.style.willChange = ''; }
   });
-  for (let i = Math.min(n - 1, f + 15); i <= Math.min(n - 1, f + 30); i++) preload(list[i].cover);
+  for (let i = Math.min(n - 1, f + 9); i <= Math.min(n - 1, f + 24); i++) preload(list[i].cover);
   for (let i = lo; i <= hi; i++) {
     const d = i - pos, el = crateEl(i);
     let rx, y, z, sh, op = 1;
@@ -941,9 +944,12 @@ function crateDraw(force) {
     } else {                            // ligger framfälld mot framkanten
       const t = Math.min(1, -d - 1); rx = -80 - t * 4; y = 0.02 * S; z = 0.07 * S + t * 0.02 * S; sh = 0.35 + t * 0.2; op = 1 - t;
     }
-    el.hidden = false;
-    el.style.willChange = 'transform, opacity';   // bara de ~19 synliga får ett eget grafiklager
-    el.style.visibility = op > 0.001 ? 'visible' : 'hidden';
+    // Skivor som inte syns alls (längst bak eller helt framfällda) göms, så att bara de ~10 synliga hålls
+    // som grafiklager. För många lager fick telefonen att släppa och rita om omslag medan man bläddrade.
+    const vis = op > 0.001;
+    el.hidden = !vis;
+    if (!vis) { el.style.willChange = ''; continue; }
+    el.style.willChange = 'transform, opacity';
     el.style.transform = `translate3d(0,${y.toFixed(1)}px,${z.toFixed(1)}px) rotateX(${rx.toFixed(2)}deg)`;
     // Ordningen följer bara platsen i listan (lägre nummer ligger framför), så z-index behöver inte
     // ändras varje bildruta. Backen (#stage) är en egen stapling, så värdet krockar inte med framkanten.
@@ -1860,8 +1866,11 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-22';
+const WEB_VERSION = '2026-11-22b';
 const CHANGELOG = [
+  { d: '2026-11-22', t: 'Kameran öppnas av sig själv', i: [
+    'I "Fota många skivor" öppnas kameran igen direkt efter varje foto. Tryck bakåt i kameran när du vill pausa eller är klar. Kräver senaste appen från GitHub (Android-skal v6).',
+    'Rättat: omslagen i backen kunde flimra när du bläddrade. Omslagen ritas nu färdiga på en gång, och färre omslag hålls ritade samtidigt.' ] },
   { d: '2026-11-22', t: 'Fota många skivor i rad', i: [
     'Ny: 📸 "Fota många skivor" under +. Fota skiva efter skiva, framsida eller baksida. Fotona bearbetas i bakgrunden medan du fotar nästa. Säkra träffar läggs in direkt, resten hamnar i "Att granska".',
     '"Att granska" visar en liten bild av fotot och Geminis gissning, så att du ser vilken skiva det var. "Sök med text" söker direkt på gissningen.',
@@ -2250,7 +2259,7 @@ async function searchBarcode(code, onWait = () => {}) {
 /* ---------------- Snabbläge för foton: många skivor i rad ----------------
    Fota skiva efter skiva. Fotona bearbetas ett i taget i bakgrunden medan man fotar nästa. Säkra träffar
    läggs in direkt, resten hamnar i "Att granska" med en liten bild av fotot. */
-const cov = { active: false, jobs: [], running: false, st: null, now: '', small: '' };
+const cov = { active: false, jobs: [], running: false, cam: false, st: null, now: '', small: '' };
 const HOW = { barcode: 'streckkod', text: 'texten på omslaget', gemini: 'Gemini' };
 const covStatsText = st => `${st.shot} fotade · ${st.added} tillagda${st.dup ? ` · ${st.dup} fanns redan` : ''}${st.review ? ` · ${st.review} att granska` : ''}`;
 // Lägger ett foto i "Att granska". Ger false om streckkoden redan ligger där.
@@ -2275,6 +2284,25 @@ function drawCov() {
   $('#covNow').innerHTML = cov.now;
   $('#covSmall').innerHTML = cov.small + (!cov.active && pending ? `<br>Bearbetar ${pending} foto${pending > 1 ? 'n' : ''} till…` : '');
 }
+const b64Blob = b64 => {
+  const bin = atob(b64), bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: 'image/jpeg' });
+};
+// Med Android-skal v6 öppnas kameran igen direkt efter varje foto, tills man trycker bakåt i kameran.
+const camAuto = () => nativeVer() >= 6;
+async function camLoop() {
+  if (cov.cam) return;
+  cov.cam = true;
+  try {
+    while (cov.active) {
+      let b64;
+      try { b64 = await native(id => App.capturePhoto(id, 3000)); }
+      catch (e) { if (e.message !== 'cancel') toast(e.message, 4000); break; }   // bakåt i kameran = paus
+      if (b64) enqueueCov(b64Blob(b64));
+    }
+  } finally { cov.cam = false; drawCov(); }
+}
 function startCovers(openCam = true) {
   if (batching) return;
   if (!cfg.discogs) { toast('Lägg in din Discogs-token under ⚙︎ först.'); return; }
@@ -2285,10 +2313,12 @@ function startCovers(openCam = true) {
   if (!cov.running) {
     cov.now = cov.st.shot ? 'Fota nästa skiva' : 'Fota första skivan';
     cov.small = 'Framsida eller baksida. Säkra träffar läggs in direkt, resten hamnar i "Att granska".'
-      + (cfg.gemini ? '' : ' Utan Gemini-nyckel (⚙︎) känns bara streckkoder och tydlig text igen.');
+      + (cfg.gemini ? '' : ' Utan Gemini-nyckel (⚙︎) känns bara streckkoder och tydlig text igen.')
+      + (camAuto() ? '<br>Kameran öppnas igen efter varje foto. Tryck bakåt i kameran när du vill pausa.'
+        : nativeVer() ? '<br>Installera senaste appen från GitHub så öppnas kameran av sig själv efter varje foto.' : '');
   }
   drawCov();
-  if (openCam) $('#covInput').click();   // samma tryckning öppnar kameran direkt
+  if (openCam) camAuto() ? camLoop() : $('#covInput').click();   // samma tryckning öppnar kameran direkt
 }
 async function enqueueCov(file) {
   if (!cov.st) cov.st = { shot: 0, added: 0, dup: 0, review: 0 };
@@ -2331,7 +2361,7 @@ async function runCov() {
     }
   } finally {
     cov.running = false;
-    if (cov.active) { cov.small += '<br>Fota nästa skiva, eller tryck Klar.'; drawCov(); } else finishCov();
+    if (cov.active) { if (!cov.cam) cov.small += '<br>Fota nästa skiva, eller tryck Klar.'; drawCov(); } else finishCov();
     setTimeout(resolveArtists, 1500);
   }
 }
@@ -2342,7 +2372,13 @@ function finishCov() {
   render(); renderQueue();
 }
 $('#btnCovers').onclick = () => startCovers();
-$('#covInput').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) enqueueCov(f); };
+$('#covInput').onchange = e => {
+  const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+  enqueueCov(f);
+  // Äldre app: försök öppna kameran igen. Tillåter inte telefonen det trycker man på knappen som förut.
+  if (cov.active) setTimeout(() => { if (cov.active) $('#covInput').click(); }, 400);
+};
+$('#covShoot').addEventListener('click', e => { if (camAuto()) { e.preventDefault(); camLoop(); } });
 $('#covDone').onclick = () => {
   cov.active = false; LS.set('sh.covmode', false);
   if (!cov.running && !cov.jobs.length) finishCov(); else drawCov();
@@ -2858,9 +2894,7 @@ async function checkPending() {
   try {
     const p = JSON.parse(await native(id => App.takePending(id)) || '{}');
     if (p.type === 'photo' && p.data) {
-      const bin = atob(p.data), bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      const blob = new Blob([bytes], { type: 'image/jpeg' });
+      const blob = b64Blob(p.data);
       toast('Fortsätter med fotot du tog');
       // Var snabbläget igång fortsätter det där, annars som ett vanligt foto.
       if (LS.get('sh.covmode', false)) { openAdd(addDefault); startCovers(false); enqueueCov(blob); }
