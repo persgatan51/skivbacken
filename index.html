@@ -1149,7 +1149,11 @@ function gemCount(add = 0) {
   if (c.day !== today()) c = { day: today(), n: 0 };
   c.n += add; LS.set('sh.gem', c); return c.n;
 }
-async function geminiIdentify(b64) {
+// Varje anrop får högst 20 s och hela igenkänningen högst 45 s. Utan gräns kunde appen snurra
+// i all oändlighet på "Frågar Gemini…" när Google inte svarade.
+const GEM_TIMEOUT = 20000, GEM_TOTAL = 45000;
+async function geminiIdentify(b64, note = () => {}) {
+  const deadline = Date.now() + GEM_TOTAL;
   const prompt = `Bilden visar en skiva (LP, singel eller CD): framsida, baksida eller etikett.
 Vilken skiva är det? Svara ENBART med JSON, null för det du inte vet:
 {"artist": "...", "title": "...", "year": 1977, "catno": "...", "confidence": "high|medium|low"}
@@ -1157,17 +1161,33 @@ Om du känner igen omslaget utan text, fyll i artist och title ändå.`;
   const models = cfg.geminiModel ? [cfg.geminiModel, ...GEMINI_MODELS.filter(m => m !== cfg.geminiModel)] : GEMINI_MODELS;
   let last = '';
   for (const model of models) {
-    const call = () => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST',
+    if (Date.now() > deadline - 3000) { last = last || 'timeout'; break; }
+    const call = async () => {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), Math.min(GEM_TIMEOUT, deadline - Date.now()));
+      try {
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      method: 'POST', signal: ctl.signal,
       headers: { 'content-type': 'application/json', 'x-goog-api-key': cfg.gemini },
       body: JSON.stringify({
         contents: [{ parts: [{ inline_data: { mime_type: 'image/jpeg', data: b64 } }, { text: prompt }] }],
         generationConfig: { responseMimeType: 'application/json', temperature: 0 }
       })
-    });
-    let r = await call();
-    if (r.status === 503) { await sleepMs(1500); r = await call(); }   // ett omförsök på samma modell först
-    const j = await r.json().catch(() => ({}));
+        });
+        // Svaret läses inom samma tidsgräns (det kan också fastna).
+        return { r: res, j: await res.json().catch(e => { if (e.name === 'AbortError') throw e; return {}; }) };
+      } finally { clearTimeout(t); }
+    };
+    let r, j;
+    try {
+      ({ r, j } = await call());
+      if (r.status === 503 && Date.now() < deadline - GEM_TIMEOUT) { await sleepMs(1500); ({ r, j } = await call()); }   // ett omförsök på samma modell först
+    } catch (e) {
+      // Inget svar i tid (eller nätfel): prova nästa modell.
+      last = e.name === 'AbortError' ? 'timeout' : 'network';
+      note(`Gemini svarar inte (${model}). Provar nästa…`);
+      continue;
+    }
     if (r.ok) {
       gemCount(1);
       const text = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
@@ -1181,7 +1201,9 @@ Om du känner igen omslaget utan text, fyll i artist och title ändå.`;
     // 500/503 = tillfälligt fel eller överbelastad modell (vanligt på gratisnivån): prova nästa modell.
     if (![429, 404, 403, 500, 503].includes(r.status)) break;
   }
-  throw new Error(/quota|429|exhausted/i.test(last) ? 'Dagens gratisanrop till Gemini är slut.'
+  throw new Error(last === 'timeout' ? 'Gemini svarade inte i tid.'
+    : last === 'network' ? 'Ingen kontakt med Gemini. Kolla nätet.'
+    : /quota|429|exhausted/i.test(last) ? 'Dagens gratisanrop till Gemini är slut.'
     : /overload|unavailable|503|500/i.test(last) ? 'Gemini är överbelastat just nu. Försök igen om en stund.' : 'Gemini: ' + last);
 }
 async function findFromInfo(info) {
@@ -1290,7 +1312,7 @@ async function identifyPhoto(file, note = () => {}) {
     if (cfg.gemini) {
       try {
         note('Frågar Gemini om omslaget…');
-        const info = await geminiIdentify(await toJpegBase64(file, 1024));
+        const info = await geminiIdentify(await toJpegBase64(file, 1024), note);
         if (info.artist || info.title) {
           out.info = info; out.q = [info.artist, info.title].filter(Boolean).join(' ');
           note(`Gemini tror "${[info.artist, info.title].filter(Boolean).join(' – ')}". Söker i Discogs…`);
@@ -1846,6 +1868,7 @@ const CHANGELOG = [
     'Tydlig text på omslaget räcker nu utan Gemini, så att gratisanropen räcker till fler skivor.',
     'Streckkoden läses i högre upplösning, så att den hittas även när hela baksidan är med på fotot.',
     'Sökrutan fylls inte längre med texten från fotot. Hittas ingen skiva läggs texten där så att du kan rätta den; annars finns en knapp "Sök på …".',
+    'Rättat: appen kunde snurra för evigt på "Frågar Gemini om omslaget…". Nu ger den upp efter en stund och söker på texten i stället.',
     'Rättat: fotade du en ny skiva innan förra var klar kunde träffarna för fel skiva visas.',
     'Rättat: när Discogs har "för många sökningar" väntar fotot och försöker igen i stället för att visa ett fel. Går det ändå inte hamnar skivan i "Att granska".',
     'Snabbskanningen säger "Fanns redan" om du har något av albumen streckkoden kan vara, och lägger inte samma okända streckkod i "Att granska" två gånger.' ] },
