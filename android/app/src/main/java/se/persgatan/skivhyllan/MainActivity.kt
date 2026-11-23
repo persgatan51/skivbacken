@@ -48,6 +48,7 @@ import java.util.concurrent.Executors
  *  - att Spotify-inloggningen sker inne i appen så att svaret kommer tillbaka hit,
  *  - App.takePending(): foto/backup som blev kvar om Android stängde appen medan kameran eller filväljaren var öppen,
  *  - App.share(): telefonens dela-meny (t.ex. för önskelistan),
+ *  - App.captureScan(): som capturePhoto, men streckkod och text läses direkt i telefonen (v7),
  *  - App.capturePhoto(): kameran direkt, med fotot tillbaka som base64 (snabbläget fotar skiva efter skiva
  *    utan att man behöver trycka mellan fotona),
  *  - att appen laddar om sidan i stället för att stängas om WebViews ritprocess kraschar.
@@ -78,6 +79,7 @@ class MainActivity : Activity() {
     // App.capturePhoto: väntande anrop, största bildsida och filen kameran sparar i.
     private var pendingPhotoId: String? = null
     private var pendingPhotoMax = 3000
+    private var pendingPhotoScan = false   // captureScan (v7): läs av i telefonen och svara med liten bild
     private var camUri: Uri? = null
     // Värd för sidan som visas just nu. Bryggan används bara när det är webbappen.
     @Volatile private var pageHost: String? = null
@@ -235,7 +237,16 @@ class MainActivity : Activity() {
     }
 
     /** Läser in fotot nedskalat (max [max] px) och vänt rätt enligt EXIF, som JPEG i base64. */
-    private fun photoB64(uri: Uri, max: Int = 2000): String {
+    private fun photoB64(uri: Uri, max: Int = 2000): String = jpegB64(photoBitmap(uri, max), 90)
+
+    private fun jpegB64(bmp: Bitmap, quality: Int): String {
+        val bos = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.JPEG, quality, bos)
+        return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+    }
+
+    /** Fotot som bitmap, nedskalat (max [max] px) och vänt rätt enligt EXIF. */
+    private fun photoBitmap(uri: Uri, max: Int): Bitmap {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         val big = maxOf(bounds.outWidth, bounds.outHeight)
@@ -267,10 +278,8 @@ class MainActivity : Activity() {
                 }
             } ?: 0f
         } catch (_: Exception) { 0f }
-        val out = if (rot != 0f) Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(rot) }, true) else bmp
-        val bos = ByteArrayOutputStream()
-        out.compress(Bitmap.CompressFormat.JPEG, 90, bos)
-        return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+        return if (rot != 0f) Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(rot) }, true)
+            .also { if (it !== bmp) bmp.recycle() } else bmp
     }
 
     @Deprecated("Deprecated in Java")
@@ -297,6 +306,9 @@ class MainActivity : Activity() {
     private fun scan(b64: String): String {
         val bytes = Base64.decode(b64, Base64.DEFAULT)
         val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: throw Exception("Kunde inte läsa bilden")
+        return scanBitmap(bmp).toString()
+    }
+    private fun scanBitmap(bmp: Bitmap): JSONObject {
         val image = InputImage.fromBitmap(bmp, 0)
         val codes = Tasks.await(barcodeScanner.process(image))
         val text = Tasks.await(textRecognizer.process(image))
@@ -306,17 +318,17 @@ class MainActivity : Activity() {
         for (block in text.textBlocks) for (line in block.lines) {
             lines.put(JSONObject().put("t", line.text).put("h", line.boundingBox?.height() ?: 0))
         }
-        return JSONObject().put("barcodes", barcodes).put("lines", lines).toString()
+        return JSONObject().put("barcodes", barcodes).put("lines", lines)
     }
 
     /* ---------- Kameran direkt (snabbläget för foton) ---------- */
-    private fun startCapture(id: String, max: Int) {
+    private fun startCapture(id: String, max: Int, scan: Boolean = false) {
         pendingPhotoId?.let { reply(it, false, "cancel") }
         val dir = File(cacheDir, "camera").apply { mkdirs() }
         dir.listFiles()?.forEach { it.delete() }
         val file = File(dir, "skiva-${System.currentTimeMillis()}.jpg")
         val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
-        camUri = uri; pendingPhotoId = id; pendingPhotoMax = max.coerceIn(800, 4000)
+        camUri = uri; pendingPhotoId = id; pendingPhotoMax = max.coerceIn(800, 4000); pendingPhotoScan = scan
         val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
             .putExtra(MediaStore.EXTRA_OUTPUT, uri)
             .addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -334,10 +346,27 @@ class MainActivity : Activity() {
         }
         if (resultCode != RESULT_OK || uri == null) { reply(id, false, "cancel"); return }
         val max = pendingPhotoMax
+        val scan = pendingPhotoScan
         worker.execute {
-            try { reply(id, true, photoB64(uri, max)) }
+            try { reply(id, true, if (scan) captureScanResult(uri) else photoB64(uri, max)) }
             catch (e: Throwable) { reply(id, false, "Kunde inte läsa fotot: ${e.message ?: e.javaClass.simpleName}") }
         }
+    }
+
+    /** Läser streckkod och text på fotot i 3000 px och svarar med resultatet och fotot i 1024 px (för Gemini
+     *  och den lilla bilden i "Att granska"). Då behöver det stora fotot aldrig skickas till webbappen. */
+    private fun captureScanResult(uri: Uri): String {
+        val big = photoBitmap(uri, 3000)
+        val scanned = scanBitmap(big)
+        val dm = maxOf(big.width, big.height)
+        val small = if (dm > 1024) {
+            val k = 1024f / dm
+            Bitmap.createScaledBitmap(big, (big.width * k).toInt(), (big.height * k).toInt(), true)
+        } else big
+        val img = jpegB64(small, 85)
+        if (small !== big) small.recycle()
+        big.recycle()
+        return JSONObject().put("scan", scanned).put("img", img).toString()
     }
 
     /* ---------- Backup: en JSON-fil på valfri plats, t.ex. Google Drive ---------- */
@@ -423,7 +452,7 @@ class MainActivity : Activity() {
         // Bara webbappen får använda bryggan, inte andra sidor som visas i appen (t.ex. Spotifys inloggning).
         private fun trusted() = pageHost == HOST
 
-        @JavascriptInterface fun version(): String = if (trusted()) "6" else "0"
+        @JavascriptInterface fun version(): String = if (trusted()) "7" else "0"
 
         /** mode: "auto" = bara om en fil redan är vald, "save" = samma fil som förut (annars välj), "pick" = välj ny plats. */
         @JavascriptInterface fun saveBackup(json: String, id: String, mode: String) {
@@ -488,6 +517,11 @@ class MainActivity : Activity() {
         /** Kameran (v6). Svarar med fotot som JPEG i base64 (längsta sida högst max px), "cancel" eller ett fel. */
         @JavascriptInterface fun capturePhoto(id: String, max: Int) {
             if (trusted()) runOnUiThread { startCapture(id, max) }
+        }
+        /** Kameran, och läser av fotot direkt i telefonen (v7). Svarar med JSON { scan: { barcodes, lines },
+         *  img: JPEG i base64, längsta sida 1024 px }, "cancel" eller ett fel. */
+        @JavascriptInterface fun captureScan(id: String) {
+            if (trusted()) runOnUiThread { startCapture(id, 3000, true) }
         }
         /** Öppnar telefonens dela-meny med en text (v5). */
         @JavascriptInterface fun share(text: String, title: String) {

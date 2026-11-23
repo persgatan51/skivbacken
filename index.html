@@ -1053,12 +1053,18 @@ addEventListener('resize', () => crateLayout());
 // (Discogs räknar fortfarande senaste minuten).
 const dgLog = LS.get('sh.dglog', []).filter(t => Date.now() - t < 60000);
 let dgBlock = LS.get('sh.dgblock', 0);   // efter 429: vänta till den här tidpunkten
+// Det man gör själv (fota många, snabbskanna, söka) går före bakgrundsjobbet: medan fgBusy > 0, och 10 s efter
+// senaste förgrundsanropet, väntar bakgrunden. Annars tog den 40 av 56 anrop per minut och fotona gick långsamt.
+let fgBusy = 0, fgLast = 0;
+const fgDone = () => { fgBusy = Math.max(0, fgBusy - 1); fgLast = Date.now(); };
 async function dgSlot(bg) {
   for (;;) {
     const now = Date.now();
+    if (!bg) fgLast = now;
     while (dgLog.length && now - dgLog[0] > 60000) dgLog.shift();
     const gap = now - (dgLog[dgLog.length - 1] || 0);
-    if (now >= dgBlock && dgLog.length < (bg ? 40 : 56) && gap >= (bg ? 1200 : 200)) {
+    const bgOk = !bg || (!fgBusy && now - fgLast > 10000);
+    if (now >= dgBlock && bgOk && dgLog.length < (bg ? 40 : 56) && gap >= (bg ? 1200 : 200)) {
       dgLog.push(now); LS.set('sh.dglog', dgLog); return;
     }
     await new Promise(r => setTimeout(r, now < dgBlock ? Math.min(dgBlock - now, 5000) : bg ? 1200 : 250));
@@ -1128,16 +1134,48 @@ async function toJpegBase64(file, max = 2000) {
 async function photoThumb(file) {
   try { return 'data:image/jpeg;base64,' + await toJpegBase64(file, 128); } catch { return ''; }
 }
+// En JPEG som redan har rätt storlek, som base64 utan att avkodas och kodas om.
+const blobB64 = b => new Promise((res, rej) => {
+  const fr = new FileReader();
+  fr.onload = () => res(String(fr.result).split(',')[1]); fr.onerror = () => rej(fr.error);
+  fr.readAsDataURL(b);
+});
+async function shrinkBlob(file, max) { return b64Blob(await toJpegBase64(file, max)); }
+/* Foton sparas i telefonen med IndexedDB (localStorage räcker inte till bilder).
+   jobs = foton i "Fota många" som inte är bearbetade än, så att de finns kvar om Android stänger appen.
+   gem = foton i "Att granska" som Gemini inte hann med, så att man kan fråga Gemini igen senare. */
+const photoDb = (() => {
+  let p = null;
+  const open = () => p || (p = new Promise((res, rej) => {
+    const r = indexedDB.open('skivbacken', 1);
+    r.onupgradeneeded = () => { r.result.createObjectStore('jobs'); r.result.createObjectStore('gem'); };
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  }).catch(e => { p = null; throw e; }));
+  const run = async (store, mode, fn) => {
+    const db = await open();
+    return new Promise((res, rej) => {
+      const t = db.transaction(store, mode), req = fn(t.objectStore(store));
+      t.oncomplete = () => res(req.result); t.onerror = t.onabort = () => rej(t.error || new Error('IndexedDB'));
+    });
+  };
+  return {
+    put: (s, k, v) => run(s, 'readwrite', o => o.put(v, k)),
+    get: (s, k) => run(s, 'readonly', o => o.get(k)),
+    del: (s, k) => run(s, 'readwrite', o => o.delete(k)),
+    keys: s => run(s, 'readonly', o => o.getAllKeys()),
+  };
+})();
 let cbSeq = 0; const cbs = {};
 window.__cb = (id, ok, data) => { const c = cbs[id]; if (!c) return; delete cbs[id]; ok ? c.res(data) : c.rej(new Error(data)); };
 function nativeScan(b64) {
   return new Promise((res, rej) => { const id = 'c' + (++cbSeq); cbs[id] = { res: d => res(JSON.parse(d)), rej }; App.scan(b64, id); });
 }
 // Android-appen läser streckkod och text med Googles ML Kit, i telefonen och utan kostnad.
-async function scanPhoto(file) {
+// raw = fotot kommer från Android-skalet och är redan nedskalat och rättvänt; då skickas det som det är.
+async function scanPhoto(file, raw = false) {
   try {
     // 3000 px: streckkoden på baksidan av en hel LP är liten, och vid 2000 px blev strecken för smala för ML Kit.
-    if (window.App && App.scan) return await nativeScan(await toJpegBase64(file, 3000));
+    if (window.App && App.scan) return await nativeScan(raw ? await blobB64(file) : await toJpegBase64(file, 3000));
     if ('BarcodeDetector' in window) {   // vanlig webbläsare: bara streckkod
       const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
       const codes = await new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e'] }).detect(bmp);
@@ -1207,10 +1245,13 @@ Om du känner igen omslaget utan text, fyll i artist och title ändå.`;
     // 500/503 = tillfälligt fel eller överbelastad modell (vanligt på gratisnivån): prova nästa modell.
     if (![429, 404, 403, 500, 503].includes(r.status)) break;
   }
-  throw new Error(last === 'timeout' ? 'Gemini svarade inte i tid.'
+  const err = new Error(last === 'timeout' ? 'Gemini svarade inte i tid.'
     : last === 'network' ? 'Ingen kontakt med Gemini. Kolla nätet.'
     : /quota|429|exhausted/i.test(last) ? 'Dagens gratisanrop till Gemini är slut.'
     : /overload|unavailable|503|500/i.test(last) ? 'Gemini är överbelastat just nu. Försök igen om en stund.' : 'Gemini: ' + last);
+  // retry = det kan gå senare (tidsgräns, nätet, dagens kvot, överbelastning), så fotot sparas för ett nytt försök.
+  err.retry = last === 'timeout' || last === 'network' || /quota|429|exhausted|overload|unavailable|503|500/i.test(last);
+  throw err;
 }
 async function findFromInfo(info) {
   const tries = [];
@@ -1286,12 +1327,14 @@ function sureHit(cands, ok) {
   return !!top && ok(top) && !cands.some(c => albumKey(c) !== albumKey(top) && ok(c));
 }
 /* Känner igen skivan på ett foto. note(text) visar vad som händer. Ger
-   { how: 'barcode'|'text'|'gemini'|'', code, cands, sure, info, q, gemErr, err }
-   sure = så säker att snabbläget kan lägga in skivan utan att fråga. err = Discogs gick inte att nå. */
-async function identifyPhoto(file, note = () => {}) {
-  const out = { how: '', code: '', cands: [], sure: false, info: null, q: '', gemErr: '', err: null };
+   { how: 'barcode'|'text'|'gemini'|'', code, cands, sure, info, q, gemErr, gemRetry, err }
+   sure = så säker att snabbläget kan lägga in skivan utan att fråga. err = Discogs gick inte att nå.
+   gemRetry = Gemini kunde inte svara nu men kan gå senare.
+   opt.scan = redan avläst i telefonen, opt.small = fotot i 1024 px (till Gemini), opt.raw = se scanPhoto. */
+async function identifyPhoto(file, note = () => {}, opt = {}) {
+  const out = { how: '', code: '', cands: [], sure: false, info: null, q: '', gemErr: '', gemRetry: false, err: null };
   note('Letar efter streckkod…');
-  const scan = await scanPhoto(file);
+  const scan = opt.scan || await scanPhoto(file, opt.raw);
   const lines = byHeight((scan.lines || []).filter(l => norm(l.t).length > 1));
   out.q = lines.slice(0, 2).map(l => l.t).join(' ');
   try {
@@ -1318,7 +1361,7 @@ async function identifyPhoto(file, note = () => {}) {
     if (cfg.gemini) {
       try {
         note('Frågar Gemini om omslaget…');
-        const info = await geminiIdentify(await toJpegBase64(file, 1024), note);
+        const info = await geminiIdentify(opt.small ? await blobB64(opt.small) : await toJpegBase64(file, 1024), note);
         if (info.artist || info.title) {
           out.info = info; out.q = [info.artist, info.title].filter(Boolean).join(' ');
           note(`Gemini tror "${[info.artist, info.title].filter(Boolean).join(' – ')}". Söker i Discogs…`);
@@ -1326,7 +1369,7 @@ async function identifyPhoto(file, note = () => {}) {
           if (c.length) return { ...out, how: 'gemini', cands: c,
             sure: info.confidence === 'high' && sureHit(c, x => infoMatch(x, info) >= 0.99) };
         }
-      } catch (e) { if (e.status || e.net) throw e; out.gemErr = e.message; }   // Discogs-fel hanteras nedan
+      } catch (e) { if (e.status || e.net) throw e; out.gemErr = e.message; out.gemRetry = !!e.retry; }   // Discogs-fel hanteras nedan
     }
     // 4. Det texten gav, utan att vara säker.
     if (textCands.length) return { ...out, how: 'text', cands: textCands };
@@ -1438,7 +1481,7 @@ $('#addStatus').addEventListener('click', e => {
   const b = e.target.closest('button[data-sq]'); if (!b) return;
   setWhat('q'); $('#aq').value = b.dataset.sq; runText(b.dataset.sq);
 });
-async function onPhoto(file) {
+async function onPhoto(file, raw = false) {
   if (!file) return;
   const seq = ++photoSeq;
   const live = () => seq === photoSeq && $('#addView').classList.contains('open');
@@ -1447,11 +1490,11 @@ async function onPhoto(file) {
   try {
     // Kopiera fotot direkt: Android-skalet raderar kamerans fil när nästa foto tas.
     file = new Blob([await file.arrayBuffer()], { type: file.type || 'image/jpeg' });
-    const res = await identifyPhoto(file, t => live() && busy(t));
+    const res = await identifyPhoto(file, t => live() && busy(t), { raw });
     if (!live()) return;
     if (res.err) {
       // Discogs gick inte att nå: lägg skivan i "Att granska" så att den kan sökas igen senare.
-      queuePhoto(res, await photoThumb(file), true); renderQueue();
+      await queuePhotoSaved(res, file, true); renderQueue();
       throw new Error(res.err.message + ' Skivan ligger i "Att granska" – tryck "Sök igen" senare.');
     }
     if (!res.cands.length) {
@@ -1866,8 +1909,13 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-22b';
+const WEB_VERSION = '2026-11-23';
 const CHANGELOG = [
+  { d: '2026-11-23', t: 'Säkrare och snabbare "Fota många"', i: [
+    'Rättat: foton som väntade på att bearbetas kunde försvinna om telefonen stängde appen medan kameran var öppen. Nu sparas varje foto direkt, och appen fortsätter med dem nästa gång den startar.',
+    'Fotona bearbetas snabbare: medan du fotar eller snabbskannar väntar hämtningen av priser och artistdata i bakgrunden, så att sökningarna i Discogs går till skivorna du fotar.',
+    'Mindre arbete per foto: med senaste appen (Android-skal v7) läses streckkod och text direkt i telefonen och bara en liten bild skickas vidare. Appen hackar mindre och tål fler foton i rad.',
+    'Ny: hann Gemini inte svara (dagens gratisanrop slut, ingen kontakt eller för långsamt) sparas fotot. Tryck "Fråga Gemini igen" i "Att granska" senare, t.ex. nästa dag.' ] },
   { d: '2026-11-22', t: 'Kameran öppnas av sig själv', i: [
     'I "Fota många skivor" öppnas kameran igen direkt efter varje foto. Tryck bakåt i kameran när du vill pausa eller är klar. Kräver senaste appen från GitHub (Android-skal v6).',
     'Rättat: omslagen i backen kunde flimra när du bläddrade. Omslagen ritas nu färdiga på en gång, och färre omslag hålls ritade samtidigt.' ] },
@@ -2189,6 +2237,7 @@ function addRecFromCand(c, status, auto = false) {
 }
 function dropQueue(i) {
   const q = scanQueue[i]; if (!q) return;
+  if (q.gem) photoDb.del('gem', q.id).catch(() => {});
   markDeleted(q.id); scanQueue.splice(i, 1); saveQueue();
 }
 // Samma Discogs-post (id och typ, en master och en utgåva kan ha samma nummer) eller samma album.
@@ -2198,7 +2247,7 @@ async function batchScan() {
   if (nativeVer() < 3) { toast('Installera senaste appversionen från GitHub för snabbskanning.', 4000); return; }
   if (!cfg.discogs) { toast('Lägg in din Discogs-token under ⚙︎ först.'); return; }
   if (batching) return;
-  batching = true; pendingQueueId = null;
+  batching = true; pendingQueueId = null; fgBusy++;
   const st = { scanned: 0, added: 0, dup: 0, review: 0 };
   const box = (big, small = '') => $('#addStatus').innerHTML = `<div class="scanbox"><div class="m">Snabbskanning · ${st.scanned} skannade · ${st.added} tillagda${st.dup ? ` · ${st.dup} fanns redan` : ''}${st.review ? ` · ${st.review} att granska` : ''}</div><div class="big">${big}</div><div class="m">${small}</div></div>`;
   $('#addResults').innerHTML = '';
@@ -2238,7 +2287,7 @@ async function batchScan() {
       await sleep(1100);
     }
   } finally {
-    batching = false;
+    batching = false; fgDone();
     box(st.scanned ? 'Klart!' : 'Skanningen avbröts', st.scanned ? 'Tryck på knappen för att fortsätta skanna.' : '');
     render(); renderQueue(); setTimeout(resolveArtists, 1500);
   }
@@ -2259,17 +2308,31 @@ async function searchBarcode(code, onWait = () => {}) {
 /* ---------------- Snabbläge för foton: många skivor i rad ----------------
    Fota skiva efter skiva. Fotona bearbetas ett i taget i bakgrunden medan man fotar nästa. Säkra träffar
    läggs in direkt, resten hamnar i "Att granska" med en liten bild av fotot. */
-const cov = { active: false, jobs: [], running: false, cam: false, st: null, now: '', small: '' };
+// jobs = [{ key, data? }]: fotot ligger i IndexedDB under key (data bara om IndexedDB inte fungerade).
+// known = alla nycklar den här sessionen, så att resumeCov inte tar samma foto två gånger.
+const cov = { active: false, jobs: [], running: false, cam: false, st: null, now: '', small: '', known: new Set() };
+let covKey = 0;
 const HOW = { barcode: 'streckkod', text: 'texten på omslaget', gemini: 'Gemini' };
 const covStatsText = st => `${st.shot} fotade · ${st.added} tillagda${st.dup ? ` · ${st.dup} fanns redan` : ''}${st.review ? ` · ${st.review} att granska` : ''}`;
-// Lägger ett foto i "Att granska". Ger false om streckkoden redan ligger där.
+// Lägger ett foto i "Att granska". Ger köposten, eller false om streckkoden redan ligger där.
 function queuePhoto(res, img, retry = false) {
   if (res.code && scanQueue.some(q => q.code === res.code)) return false;
   const g = res.info && (res.info.artist || res.info.title) ? { artist: str(res.info.artist, 120), title: str(res.info.title, 120) } : null;
-  scanQueue.push({ id: uid(), code: res.code || '', at: Date.now(),
+  const q = { id: uid(), code: res.code || '', at: Date.now(),
     cands: retry ? [] : res.cands.slice(0, 5).map(({ score, ...c }) => c),
-    ...(img ? { img } : {}), ...(res.q ? { q: str(res.q, 120) } : {}), ...(g ? { guess: g } : {}), ...(retry ? { retry: true } : {}) });
-  saveQueue(); return true;
+    ...(img ? { img } : {}), ...(res.q ? { q: str(res.q, 120) } : {}), ...(g ? { guess: g } : {}), ...(retry ? { retry: true } : {}) };
+  scanQueue.push(q); saveQueue(); return q;
+}
+// Som queuePhoto, men gör själv den lilla bilden. Kunde Gemini inte svara (eller Discogs inte nås innan Gemini
+// hann fråga) sparas fotot i 1024 px, så att "Fråga Gemini igen" fungerar senare, t.ex. när dagens kvot är slut.
+// file = fotot, small = samma foto i 1024 px om det redan finns.
+async function queuePhotoSaved(res, file, retry = false, small = null) {
+  const q = queuePhoto(res, await photoThumb(small || file), retry);
+  if (q && cfg.gemini && !res.code && !res.info && (res.gemRetry || res.err)) {
+    try { await photoDb.put('gem', q.id, small || await shrinkBlob(file, 1024)); q.gem = true; saveQueue(); }
+    catch (e) { console.log('photoDb', e); }
+  }
+  return q;
 }
 function drawCov() {
   const pending = cov.jobs.length + (cov.running ? 1 : 0);
@@ -2290,16 +2353,22 @@ const b64Blob = b64 => {
   return new Blob([bytes], { type: 'image/jpeg' });
 };
 // Med Android-skal v6 öppnas kameran igen direkt efter varje foto, tills man trycker bakåt i kameran.
+// Med v7 läses streckkod och text dessutom av direkt i telefonen, och bara en liten bild (1024 px) skickas hit.
 const camAuto = () => nativeVer() >= 6;
 async function camLoop() {
   if (cov.cam) return;
   cov.cam = true;
   try {
     while (cov.active) {
-      let b64;
-      try { b64 = await native(id => App.capturePhoto(id, 3000)); }
-      catch (e) { if (e.message !== 'cancel') toast(e.message, 4000); break; }   // bakåt i kameran = paus
-      if (b64) enqueueCov(b64Blob(b64));
+      try {
+        if (nativeVer() >= 7) {
+          const j = JSON.parse(await native(id => App.captureScan(id)));
+          if (j.img) enqueueCov(b64Blob(j.img), j.scan, 'small');
+        } else {
+          const b64 = await native(id => App.capturePhoto(id, 3000));
+          if (b64) enqueueCov(b64Blob(b64), null, 'raw');
+        }
+      } catch (e) { if (e.message !== 'cancel') toast(e.message, 4000); break; }   // bakåt i kameran = paus
     }
   } finally { cov.cam = false; drawCov(); }
 }
@@ -2320,29 +2389,59 @@ function startCovers(openCam = true) {
   drawCov();
   if (openCam) camAuto() ? camLoop() : $('#covInput').click();   // samma tryckning öppnar kameran direkt
 }
-async function enqueueCov(file) {
+// kind: 'small' = 1024 px från captureScan (scan följer med), 'raw' = redan nedskalat och rättvänt av skalet.
+async function enqueueCov(file, scan = null, kind = '') {
   if (!cov.st) cov.st = { shot: 0, added: 0, dup: 0, review: 0 };
-  let blob;
-  // Kopiera fotot direkt: Android-skalet raderar kamerans fil när nästa foto tas.
-  try { blob = new Blob([await file.arrayBuffer()], { type: file.type || 'image/jpeg' }); }
-  catch { toast('Kunde inte läsa fotot. Ta det igen.', 4000); return; }
-  cov.st.shot++; cov.jobs.push(blob); drawCov(); runCov();
+  let blob = file;
+  // Kopiera ett valt foto direkt: Android-skalet raderar kamerans fil när nästa foto tas.
+  if (file instanceof File) {
+    try { blob = new Blob([await file.arrayBuffer()], { type: file.type || 'image/jpeg' }); }
+    catch { toast('Kunde inte läsa fotot. Ta det igen.', 4000); return; }
+  }
+  const job = { key: Date.now() * 1000 + (covKey++ % 1000) }, data = { blob, scan, kind, at: Date.now() };
+  cov.known.add(job.key);
+  // Spara fotot i telefonen innan det köas. Stänger Android appen (vanligt medan kameran är öppen) finns det kvar
+  // och bearbetas när appen startar igen (resumeCov). Går det inte att spara hålls det i minnet som förut.
+  try { await photoDb.put('jobs', job.key, data); } catch (e) { console.log('photoDb', e); job.data = data; }
+  cov.st.shot++; cov.jobs.push(job); drawCov(); runCov();
+}
+// Foton från "Fota många" som inte hann bearbetas innan appen stängdes: fortsätt med dem.
+async function resumeCov() {
+  let keys;
+  try { keys = await photoDb.keys('jobs'); } catch { return; }
+  const left = keys.filter(k => !cov.known.has(k));
+  if (!left.length) return;
+  left.forEach(k => cov.known.add(k));
+  if (!cov.st) cov.st = { shot: 0, added: 0, dup: 0, review: 0 };
+  cov.st.shot += left.length;
+  cov.jobs.push(...left.map(key => ({ key })));
+  toast(`Fortsätter med ${left.length} foto${left.length > 1 ? 'n' : ''} som inte hann bearbetas`, 4000);
+  drawCov(); runCov();
+}
+// Sparade Gemini-foton vars köpost inte finns längre (t.ex. borttagen via backup) tas bort.
+async function cleanGemPhotos() {
+  try { for (const k of await photoDb.keys('gem')) if (!scanQueue.some(q => q.id === k)) await photoDb.del('gem', k); } catch {}
 }
 async function runCov() {
   if (cov.running) return;
-  cov.running = true;
+  cov.running = true; fgBusy++;
   try {
     while (cov.jobs.length) {
-      const file = cov.jobs.shift(), st = cov.st, n = st.shot - cov.jobs.length;
+      const job = cov.jobs.shift(), st = cov.st, n = st.shot - cov.jobs.length;
       const note = t => {
         cov.now = `<span class="spin"></span>${esc(t)}`;
         cov.small = `Skiva ${n}${cov.jobs.length ? ` · ${cov.jobs.length} till väntar` : ''}`; drawCov();
       };
+      const data = job.data || await photoDb.get('jobs', job.key).catch(() => null);
+      if (!data?.blob) { photoDb.del('jobs', job.key).catch(() => {}); continue; }
+      // En liten bild (1024 px) görs en gång och används till Gemini och bilden i "Att granska". Från
+      // captureScan är fotot redan litet och avläst, så den stora bilden avkodas aldrig här.
+      const small = data.kind === 'small' ? data.blob : await shrinkBlob(data.blob, 1024).catch(() => null);
       let res;
-      try { res = await identifyPhoto(file, note); } catch (e) { res = { cands: [], code: '', q: '', err: e }; }
-      const img = await photoThumb(file);
+      try { res = await identifyPhoto(data.blob, note, { scan: data.scan, small, raw: data.kind === 'raw' }); }
+      catch (e) { res = { cands: [], code: '', q: '', err: e }; }
       if (res.err) {
-        queuePhoto(res, img, true); st.review++;
+        await queuePhotoSaved(res, data.blob, true, small); st.review++;
         cov.now = 'Kunde inte söka just nu'; cov.small = 'Lagd i "Att granska" – tryck "Sök igen" senare';
       } else if (res.sure) {
         const ex = findExisting(res.cands[0]);
@@ -2352,15 +2451,17 @@ async function runCov() {
           cov.now = '✓ ' + esc(rec.title); cov.small = esc(rec.artist) + (rec.year ? ' · ' + rec.year : '') + ' · via ' + HOW[res.how];
           render();
         }
-      } else if (queuePhoto(res, img)) {
+      } else if (await queuePhotoSaved(res, data.blob, false, small)) {
         st.review++;
         cov.now = res.cands.length ? 'Osäker – kolla i "Att granska"' : 'Hittade inte skivan';
         cov.small = res.cands.length ? 'Välj rätt skiva där sen' : (res.gemErr ? esc(res.gemErr) + ' ' : '') + 'Lagd i "Att granska", sök med text sen';
       } else { st.dup++; cov.now = 'Ligger redan i "Att granska"'; cov.small = 'Streckkod ' + esc(res.code); }
+      // Fotot är omhändertaget (tillagt eller i "Att granska", som redan är sparade): ta bort det.
+      photoDb.del('jobs', job.key).catch(() => {});
       renderQueue(); drawCov();
     }
   } finally {
-    cov.running = false;
+    cov.running = false; fgDone();
     if (cov.active) { if (!cov.cam) cov.small += '<br>Fota nästa skiva, eller tryck Klar.'; drawCov(); } else finishCov();
     setTimeout(resolveArtists, 1500);
   }
@@ -2601,7 +2702,8 @@ function renderQueue() {
   el.innerHTML = `<div class="qhead">Att granska (${scanQueue.length})</div>` + scanQueue.map((q, qi) => {
     const what = q.code ? 'Streckkod ' + esc(q.code) : 'Fotad skiva';
     const guess = q.guess ? ` · Gemini: ${esc([q.guess.artist, q.guess.title].filter(Boolean).join(' – '))}` : '';
-    const state = q.cands.length ? ' · vilken är det?' : q.retry ? ' · kunde inte sökas' : q.code ? ' · hittades inte i Discogs' : ' · hittades inte';
+    const state = q.cands.length ? ' · vilken är det?' : q.retry ? ' · kunde inte sökas' : q.gem ? ' · Gemini hann inte svara'
+      : q.code ? ' · hittades inte i Discogs' : ' · hittades inte';
     return `<div class="qitem">
       <div class="qtop">${q.img ? `<img class="qimg" src="${esc(q.img)}" alt="">` : ''}<div class="m">${what}${guess}${state}</div></div>
       ${q.cands.map((c, ci) => { const ex = findExisting(c); return `<div class="cand">
@@ -2610,18 +2712,30 @@ function renderQueue() {
           ${ex ? `<div class="m">Finns redan under ${ex.status === 'have' ? 'Har' : 'Vill ha'}</div>` : ''}
           <div class="btns"><button data-q="${qi}" data-c="${ci}" data-s="have" class="on">Har den</button><button data-q="${qi}" data-c="${ci}" data-s="want">Vill ha</button></div></div></div>`; }).join('')}
       <div class="btns" style="display:flex;gap:6px;margin-top:6px">
-        ${q.retry && (q.code || q.guess || q.q) ? `<button data-retry="${qi}">Sök igen</button>` : ''}
+        ${(q.retry && (q.code || q.guess || q.q)) || q.gem ? `<button data-retry="${qi}">${q.gem && !q.code && !q.guess ? 'Fråga Gemini igen' : 'Sök igen'}</button>` : ''}
         <button data-search="${qi}">${q.cands.length ? 'Ingen av dem – sök' : 'Sök med text'}</button>
         <button data-del="${qi}">Ta bort</button>
       </div>
     </div>`; }).join('');
 }
-// "Sök igen" för en köpost: streckkoden, annars Geminis gissning eller texten på fotot.
+// "Sök igen" för en köpost: streckkoden, annars Geminis gissning, ett sparat foto som Gemini får försöka med
+// igen, eller texten på fotot.
 async function searchQueued(q) {
   if (q.code) return searchBarcode(q.code);
   try {
+    if (!q.guess && q.gem) {
+      const blob = await photoDb.get('gem', q.id).catch(() => null);
+      if (blob) {
+        let info;
+        try { info = await geminiIdentify(await blobB64(blob)); }
+        catch (e) { return { cands: [], err: e }; }   // fortfarande ingen Gemini: fotot sparas för nästa försök
+        if (info.artist || info.title) q.guess = { artist: str(info.artist, 120), title: str(info.title, 120) };
+      }
+      // Gemini har svarat (eller fotot finns inte längre): det sparade fotot behövs inte mer.
+      photoDb.del('gem', q.id).catch(() => {}); delete q.gem; saveQueue();
+    }
     const c = q.guess ? await findFromInfo(q.guess)
-      : (await dgSearchR({ q: q.q, type: 'master', per_page: 8, ...fmtP() })).map(toCand);
+      : q.q ? (await dgSearchR({ q: q.q, type: 'master', per_page: 8, ...fmtP() })).map(toCand) : [];
     return { cands: c };
   } catch (e) { return { cands: [], err: e }; }
 }
@@ -2897,8 +3011,8 @@ async function checkPending() {
       const blob = b64Blob(p.data);
       toast('Fortsätter med fotot du tog');
       // Var snabbläget igång fortsätter det där, annars som ett vanligt foto.
-      if (LS.get('sh.covmode', false)) { openAdd(addDefault); startCovers(false); enqueueCov(blob); }
-      else { openAdd(addDefault); onPhoto(blob); }
+      if (LS.get('sh.covmode', false)) { openAdd(addDefault); startCovers(false); enqueueCov(blob, null, 'raw'); }
+      else { openAdd(addDefault); onPhoto(blob, true); }
     } else if (p.type === 'save') {
       driveSave('save');
     } else if (p.type === 'load' && p.data) {
@@ -2950,6 +3064,7 @@ window.__back = () => {
   render();
   resolveArtists();
   checkPending();
+  resumeCov().then(cleanGemPhotos);
 })();
 </script>
 </body>
