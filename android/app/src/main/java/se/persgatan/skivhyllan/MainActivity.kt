@@ -356,8 +356,19 @@ class MainActivity : Activity() {
     /** Läser streckkod och text på fotot i 3000 px och svarar med resultatet och fotot i 1024 px (för Gemini
      *  och den lilla bilden i "Att granska"). Då behöver det stora fotot aldrig skickas till webbappen. */
     private fun captureScanResult(uri: Uri): String {
-        val big = photoBitmap(uri, 3000)
-        val scanned = scanBitmap(big)
+        // Räcker inte minnet (äldre telefoner) provas en mindre bild, hellre än att fotot försvinner.
+        var big: Bitmap? = null
+        for (size in intArrayOf(3000, 2000, 1200)) {
+            try { big = photoBitmap(uri, size); break } catch (_: OutOfMemoryError) { System.gc() }
+        }
+        val bmp = big ?: throw Exception("för lite minne")
+        return captureScanFrom(bmp)
+    }
+    private fun captureScanFrom(big: Bitmap): String {
+        // Misslyckas avläsningen skickas fotot ändå, utan streckkod och text, så att Gemini kan försöka.
+        val scanned = try { scanBitmap(big) } catch (_: Throwable) {
+            JSONObject().put("barcodes", JSONArray()).put("lines", JSONArray())
+        }
         val dm = maxOf(big.width, big.height)
         val small = if (dm > 1024) {
             val k = 1024f / dm

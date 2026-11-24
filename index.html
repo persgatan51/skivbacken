@@ -1909,8 +1909,14 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-23';
+const WEB_VERSION = '2026-11-24';
 const CHANGELOG = [
+  { d: '2026-11-24', t: 'Rättningar i "Fota många"', i: [
+    'Rättat: om telefonen inte orkade läsa av ett foto (t.ex. för lite minne) kunde fotot försvinna. Nu provas en mindre bild, och fotot skickas vidare till Gemini även om streckkod och text inte gick att läsa. Kräver nya appen från GitHub.',
+    'Gick ett foto ändå inte att läsa öppnas kameran igen, så att du kan fota om skivan.',
+    'Rättat: knappen "Sök igen" kunde försvinna i "Att granska" om Gemini svarade men Discogs inte gick att nå.',
+    'Rättat: stängdes appen mitt i bearbetningen kunde samma foto hamna två gånger i "Att granska".',
+    'Foton som bearbetas klart medan Lägg till är stängd visar nu en sammanfattning: hur många som lades till och hur många som ligger i "Att granska".' ] },
   { d: '2026-11-23', t: 'Säkrare och snabbare "Fota många"', i: [
     'Rättat: foton som väntade på att bearbetas kunde försvinna om telefonen stängde appen medan kameran var öppen. Nu sparas varje foto direkt, och appen fortsätter med dem nästa gång den startar.',
     'Fotona bearbetas snabbare: medan du fotar eller snabbskannar väntar hämtningen av priser och artistdata i bakgrunden, så att sökningarna i Discogs går till skivorna du fotar.',
@@ -2326,8 +2332,10 @@ function queuePhoto(res, img, retry = false) {
 // Som queuePhoto, men gör själv den lilla bilden. Kunde Gemini inte svara (eller Discogs inte nås innan Gemini
 // hann fråga) sparas fotot i 1024 px, så att "Fråga Gemini igen" fungerar senare, t.ex. när dagens kvot är slut.
 // file = fotot, small = samma foto i 1024 px om det redan finns.
-async function queuePhotoSaved(res, file, retry = false, small = null) {
+// job = nyckeln för fotot i "Fota många", så att samma foto inte köas två gånger om appen stängs mitt i.
+async function queuePhotoSaved(res, file, retry = false, small = null, job = 0) {
   const q = queuePhoto(res, await photoThumb(small || file), retry);
+  if (q && job) { q.job = job; saveQueue(); }
   if (q && cfg.gemini && !res.code && !res.info && (res.gemRetry || res.err)) {
     try { await photoDb.put('gem', q.id, small || await shrinkBlob(file, 1024)); q.gem = true; saveQueue(); }
     catch (e) { console.log('photoDb', e); }
@@ -2368,7 +2376,13 @@ async function camLoop() {
           const b64 = await native(id => App.capturePhoto(id, 3000));
           if (b64) enqueueCov(b64Blob(b64), null, 'raw');
         }
-      } catch (e) { if (e.message !== 'cancel') toast(e.message, 4000); break; }   // bakåt i kameran = paus
+      } catch (e) {
+        if (e.message === 'cancel') break;   // bakåt i kameran = paus
+        toast(e.message, 4000);
+        // Ett foto som inte gick att läsa: öppna kameran igen så att man kan fota om. Andra fel (t.ex. kameran
+        // gick inte att öppna) avbryter, annars skulle det bli en evig loop.
+        if (!/^Kunde inte läsa fotot/.test(e.message)) break;
+      }
     }
   } finally { cov.cam = false; drawCov(); }
 }
@@ -2434,6 +2448,8 @@ async function runCov() {
       };
       const data = job.data || await photoDb.get('jobs', job.key).catch(() => null);
       if (!data?.blob) { photoDb.del('jobs', job.key).catch(() => {}); continue; }
+      // Redan i "Att granska" (appen stängdes efter att fotot köats men innan det togs bort): bara städa.
+      if (scanQueue.some(q => q.job === job.key)) { photoDb.del('jobs', job.key).catch(() => {}); continue; }
       // En liten bild (1024 px) görs en gång och används till Gemini och bilden i "Att granska". Från
       // captureScan är fotot redan litet och avläst, så den stora bilden avkodas aldrig här.
       const small = data.kind === 'small' ? data.blob : await shrinkBlob(data.blob, 1024).catch(() => null);
@@ -2441,7 +2457,7 @@ async function runCov() {
       try { res = await identifyPhoto(data.blob, note, { scan: data.scan, small, raw: data.kind === 'raw' }); }
       catch (e) { res = { cands: [], code: '', q: '', err: e }; }
       if (res.err) {
-        await queuePhotoSaved(res, data.blob, true, small); st.review++;
+        await queuePhotoSaved(res, data.blob, true, small, job.key); st.review++;
         cov.now = 'Kunde inte söka just nu'; cov.small = 'Lagd i "Att granska" – tryck "Sök igen" senare';
       } else if (res.sure) {
         const ex = findExisting(res.cands[0]);
@@ -2451,7 +2467,7 @@ async function runCov() {
           cov.now = '✓ ' + esc(rec.title); cov.small = esc(rec.artist) + (rec.year ? ' · ' + rec.year : '') + ' · via ' + HOW[res.how];
           render();
         }
-      } else if (await queuePhotoSaved(res, data.blob, false, small)) {
+      } else if (await queuePhotoSaved(res, data.blob, false, small, job.key)) {
         st.review++;
         cov.now = res.cands.length ? 'Osäker – kolla i "Att granska"' : 'Hittade inte skivan';
         cov.small = res.cands.length ? 'Välj rätt skiva där sen' : (res.gemErr ? esc(res.gemErr) + ' ' : '') + 'Lagd i "Att granska", sök med text sen';
@@ -2470,6 +2486,7 @@ function finishCov() {
   const st = cov.st; cov.st = null; drawCov();
   if (st?.shot && $('#addView').classList.contains('open'))
     $('#addStatus').innerHTML = `<div class="scanbox"><div class="big">Klart!</div><div class="m">${covStatsText(st)}</div></div>`;
+  else if (st?.shot) toast('Fotona är klara: ' + covStatsText(st), 6000);   // t.ex. foton som togs upp igen vid start
   render(); renderQueue();
 }
 $('#btnCovers').onclick = () => startCovers();
@@ -2747,7 +2764,11 @@ $('#queueBox').addEventListener('click', e => {
     const q = scanQueue[+b.dataset.retry]; if (!q) return;
     b.disabled = true; b.innerHTML = '<span class="spin"></span>Söker…';
     searchQueued(q).then(res => {
-      if (res.err) { toast(res.err.message, 4000); renderQueue(); return; }
+      if (res.err) {
+        // Gemini kan ha svarat innan Discogs felade: se till att "Sök igen" finns kvar.
+        if (q.code || q.guess || q.q) { q.retry = true; saveQueue(); }
+        toast(res.err.message, 4000); renderQueue(); return;
+      }
       q.cands = res.cands.slice(0, 5).map(({ score, ...c }) => c); delete q.retry;
       // Säker träff (ett enda album, via streckkod) läggs in direkt, som vid snabbskanningen.
       const masters = new Set(res.cands.map(c => c.masterId || 'r' + c.dId));
