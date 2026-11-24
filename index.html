@@ -162,6 +162,11 @@
   .rlist .ri img,.rlist .ri .ph{width:40px;height:40px;border-radius:4px;font-size:16px}
   .rlist .ri .x{font-size:13px;text-align:right;font-variant-numeric:tabular-nums}
   .spark{width:100%;height:64px;display:block;margin-top:6px}
+  .rlist .ri.tidy{cursor:default}
+  .rlist .ri.tidy [data-rid]{cursor:pointer}
+  .ri.tidy .tb{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+  .ri.tidy .tb button{padding:5px 10px;font-size:13px}
+  .tvers .cand{padding-left:4px}
   .shop .hit{display:grid;grid-template-columns:96px 1fr;gap:12px;align-items:center;margin-top:12px}
   .shop .hit img,.shop .hit .ph{width:96px;height:96px;border-radius:8px;object-fit:cover}
   .shop .hit .t{font-size:16px;-webkit-line-clamp:3}
@@ -695,8 +700,8 @@ function sparkSvg(pts) {
     ${xy.map(([x, y], i) => `<rect x="${(x - 8).toFixed(1)}" y="0" width="16" height="${H}" fill="transparent"><title>${esc(new Date(pts[i].t).toLocaleDateString('sv-SE'))}: ${esc(money(pts[i].v, pts[i].c).replace(/&[^;]+;/g, ''))}</title></rect>`).join('')}
     </svg>`;
 }
-async function showVersions(r, masterId) {
-  const box = $('#dVersList');
+// box = rutan listan visas i, done = vad som händer när en utgåva valts (detaljvyn: rita om värdet).
+async function showVersions(r, masterId, box = $('#dVersList'), done = () => drawValue(r)) {
   box.innerHTML = '<div class="m" style="margin-top:8px"><span class="spin"></span>Hämtar utgåvor…</div>';
   try {
     const j = await dg(`/masters/${masterId}/versions`, { per_page: 100, sort: 'released', sort_order: 'asc' });
@@ -713,7 +718,7 @@ async function showVersions(r, masterId) {
       r.rid = x.id;
       r.relLabel = [x.format, x.country, x.released, x.catno].filter(Boolean).join(' · ');
       // Ny utgåva = nytt pris och ny historik.
-      r.price = null; delete r.priceErr; delete r.priceHist; saveRecs(); drawValue(r);
+      r.price = null; delete r.priceErr; delete r.priceHist; saveRecs(); done();
     };
   } catch (e) { box.innerHTML = `<div class="m">${esc(e.message)}</div>`; }
 }
@@ -1909,8 +1914,13 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-24';
+const WEB_VERSION = '2026-11-24b';
 const CHANGELOG = [
+  { d: '2026-11-24', t: 'Städa samlingen, avdelare och genvägar', i: [
+    'Ny: "Städa samlingen" under 📊 visar skivor som saknar omslag, år eller genre, vald utgåva, Spotify-album eller pris, och hur stor del av samlingen som är komplett. Varje rad har en knapp som rättar det, "Hämta alla" tar en hel grupp i taget, och "Dölj" tar bort sådant som inte går att rätta.',
+    'Ny: "Avdelare för hyllan" under 📊 räknar ut var avdelarna ska stå så att facken blir lika fulla (t.ex. "A – Bj", "Bl – Da"), eller per genre eller decennium. Etiketterna kan skrivas ut (eller sparas som PDF) eller delas som text.',
+    'Ny: långtryck på appikonen ger genvägarna "Har jag den?", "Fota många" och "Slumpa en skiva".',
+    'Utskrift och genvägar kräver senaste appen från GitHub (Android-skal v8).' ] },
   { d: '2026-11-24', t: 'Rättningar i "Fota många"', i: [
     'Rättat: om telefonen inte orkade läsa av ett foto (t.ex. för lite minne) kunde fotot försvinna. Nu provas en mindre bild, och fotot skickas vidare till Gemini även om streckkod och text inte gick att läsa. Kräver nya appen från GitHub.',
     'Gick ett foto ändå inte att läsa öppnas kameran igen, så att du kan fota om skivan.',
@@ -2080,6 +2090,7 @@ function cleanRec(r) {
   if (o.tracks && !Array.isArray(o.tracks)) delete o.tracks;
   if ('priceHist' in o) { o.priceHist = compactHist(o.priceHist); if (!o.priceHist) delete o.priceHist; }
   if (o.price) o.price = cleanPrice(o.price);
+  if ('tidySkip' in o) { o.tidySkip = Array.isArray(o.tidySkip) ? o.tidySkip.filter(k => ['cover', 'info', 'release', 'spotify', 'price'].includes(k)) : []; if (!o.tidySkip.length) delete o.tidySkip; }
   return o;
 }
 function cleanPrice(p) {
@@ -2825,6 +2836,9 @@ const statsOpen = () => $('#statsSheet').classList.contains('open');
 const closeStats = () => $('#statsSheet').classList.remove('open');
 $('#statsSheet').addEventListener('click', e => {
   if (e.target.id === 'statsSheet') { closeStats(); return; }
+  if (tidyClick(e) || divClick(e)) return;
+  if (e.target.closest('#stTidy')) { openTidy(); return; }
+  if (e.target.closest('#stDivide')) { openDivide(); return; }
   const ri = e.target.closest('[data-rid]');
   if (ri) { closeStats(); openDetail(ri.dataset.rid); return; }
   const m = e.target.closest('[data-missing]');
@@ -2842,6 +2856,277 @@ $('#worth').addEventListener('click', e => {
   else if (a.dataset.act === 'share') shareWants();
 });
 
+/* ---------------- Städa samlingen ----------------
+   Skivor som saknar något: omslag, år/genre, vald utgåva, Spotify-album eller pris. Varje rad har en knapp
+   som rättar just det, och "Dölj" för sådant som inte går att rätta (t.ex. när Discogs saknar uppgiften).
+   Det man döljer sparas per skiva i r.tidySkip och följer med i backupen. */
+const TIDY = [
+  { k: 'cover', h: 'Omslag saknas eller är litet', btn: 'Hämta omslag', all: true,
+    test: r => r.dId && (!r.cover || r.coverSmall) },
+  { k: 'info', h: 'År eller genre saknas', btn: 'Hämta uppgifter', all: true,
+    test: r => r.dId && (!r.year || !r.genre?.length) },
+  { k: 'release', h: 'Utgåva inte vald', btn: 'Välj utgåva', all: false,
+    note: 'Albumet är tillagt, men inte vilken pressning du har. Värdet räknas då på huvudutgåvan.',
+    test: r => r.status === 'have' && r.dType === 'master' && !r.relLabel && (r.masterId || r.dId) },
+  { k: 'spotify', h: 'Inget Spotify-album', btn: 'Matcha', all: true,
+    test: r => !!sp && !r.spotifyId },
+  { k: 'price', h: 'Inget pris än', btn: 'Hämta pris', all: true,
+    test: r => r.status === 'have' && r.dId && !r.price },
+];
+const tidy = { run: 0, busy: '' };   // run: löpnummer för "Hämta alla", busy: kategorin som hämtas just nu
+const tidyOpen = () => statsOpen() && !!$('#tidyView');
+const tidyMissing = (r, t) => !(r.tidySkip || []).includes(t.k) && !!t.test(r);
+// Rättar en sak på en skiva. Ger true om det blev rätt. Går det inte (Discogs/Spotify saknar uppgiften)
+// döljs raden, så att listan inte står kvar med sådant som aldrig går att rätta.
+async function tidyFix(r, k) {
+  if (k === 'cover' || k === 'info') {
+    const j = await dg(r.dType === 'master' ? `/masters/${r.dId}` : `/releases/${r.dId}`);
+    applyInfo(r, j);
+    const img = j.images?.[0];
+    if (!r.cover && img?.uri) { r.cover = img.uri; if (!r.thumb) r.thumb = img.uri150 || img.uri; }
+    delete r.infoErr;
+    crateForget(r.id); gridSig = '';
+  } else if (k === 'spotify') {
+    if ((await matchSpotify(r)) === 'net') throw new Error('Ingen kontakt med Spotify. Kolla nätet.');
+  } else if (k === 'price') {
+    delete r.priceErr; delete r.priceWait;
+    if (!(await priceNow(r))) throw new Error(r.priceErrMsg || 'Kunde inte hämta priset.');
+  }
+  const t = TIDY.find(x => x.k === k);
+  const ok = !t.test(r);
+  if (!ok) r.tidySkip = [...new Set([...(r.tidySkip || []), k])];
+  saveRecs();
+  return ok;
+}
+function tidyRow(r, t) {
+  return `<div class="ri tidy" data-tr="${esc(r.id)}">
+    ${r.thumb || r.cover ? `<img src="${esc(r.thumb || r.cover)}" alt="" loading="lazy">` : '<div class="ph">♪</div>'}
+    <div style="min-width:0" data-rid="${esc(r.id)}"><div class="t" style="margin:0">${esc(r.title)}</div>
+      <div class="m">${esc(r.artist)}${r.year ? ' · ' + esc(r.year) : ''}${r.status === 'want' ? ' · vill ha' : ''}</div></div>
+    <div class="tb"><button data-tfix="${t.k}" data-tid="${esc(r.id)}">${t.btn}</button>
+      <button data-tskip="${t.k}" data-tid="${esc(r.id)}" title="Dölj från listan">Dölj</button></div>
+  </div>${t.k === 'release' ? `<div class="tvers" id="tv-${esc(r.id)}"></div>` : ''}`;
+}
+function openTidy() {
+  const panel = $('#statsSheet .panel'), keep = tidyOpen() ? panel.scrollTop : 0;
+  const groups = TIDY.map(t => ({ t, list: sortRecs(recs.filter(r => tidyMissing(r, t))) }));
+  const bad = new Set(groups.flatMap(g => g.list.map(r => r.id)));
+  const pct = recs.length ? Math.floor(100 * (recs.length - bad.size) / recs.length) : 100;
+  const skipped = recs.filter(r => r.tidySkip?.length).length;
+  $('#statsBody').innerHTML = `<div id="tidyView">
+    <div class="row"><button id="tidyBack">‹ Statistik</button><h2 style="flex:1;text-align:center">Städa samlingen</h2><button id="closeStats">Stäng</button></div>
+    <div class="kpi" style="margin-top:10px"><span>Kompletta skivor</span><b>${pct} %</b>
+      <span>${recs.length - bad.size} av ${recs.length} har allt${skipped ? ` · ${skipped} med dolda rader (<a href="#" id="tidyUnskip">visa igen</a>)` : ''}</span></div>
+    ${!sp ? '<p class="note">Logga in på Spotify under ⚙︎ så visas även skivor utan Spotify-album.</p>' : ''}
+    ${groups.filter(g => g.list.length).map(({ t, list }) => `
+      <div class="row" style="margin-top:20px;align-items:center"><h3 style="flex:1;margin:0">${t.h} (${list.length})</h3>
+        ${t.all && list.length > 1 ? `<button data-tall="${t.k}">${tidy.busy === t.k ? '<span class="spin"></span>Stoppa' : 'Hämta alla'}</button>` : ''}</div>
+      ${t.note ? `<p class="note">${t.note}</p>` : ''}
+      <div class="rlist">${list.slice(0, 60).map(r => tidyRow(r, t)).join('')}</div>
+      ${list.length > 60 ? `<p class="note">… och ${list.length - 60} till. De visas när de första är klara.</p>` : ''}`).join('')
+    || '<p class="msg">Allt är komplett. Snyggt!</p>'}
+  </div>`;
+  $('#statsSheet').classList.add('open');
+  panel.scrollTop = keep;
+}
+// "Hämta alla" i en kategori: en skiva i taget (Discogs tillåter 60 anrop i minuten). Trycker man igen stoppas det.
+async function tidyAll(k) {
+  if (tidy.busy) { const was = tidy.busy; tidy.busy = ''; tidy.run++; if (was === k) { openTidy(); return; } }
+  const my = ++tidy.run, t = TIDY.find(x => x.k === k);
+  tidy.busy = k; fgBusy++;
+  let fixed = 0, failed = 0;
+  try {
+    for (;;) {
+      const r = sortRecs(recs.filter(x => tidyMissing(x, t)))[0];
+      if (!r || my !== tidy.run || !statsOpen()) break;
+      try { (await tidyFix(r, k)) ? fixed++ : failed++; }
+      catch (e) { toast(e.message, 4000); break; }
+      if (tidyOpen()) openTidy();
+    }
+  } finally {
+    fgDone();
+    if (my === tidy.run) tidy.busy = '';
+    render();
+    if (tidyOpen()) openTidy();
+    if (fixed || failed) toast(`${fixed} rättade${failed ? `, ${failed} gick inte (dolda)` : ''}`, 3000);
+  }
+}
+// Ger true om klicket hörde till "Städa samlingen" (eller tillbaka-knappen i Avdelare).
+function tidyClick(e) {
+  const b = e.target.closest('button[data-tfix],button[data-tskip],button[data-tall],#tidyBack,#tidyUnskip');
+  if (!b) return false;
+  e.preventDefault();
+  tidyAct(b);
+  return true;
+}
+async function tidyAct(b) {
+  if (b.id === 'tidyBack') { tidy.run++; tidy.busy = ''; openStats(); return true; }
+  if (b.id === 'tidyUnskip') { recs.forEach(r => delete r.tidySkip); saveRecs(); openTidy(); return true; }
+  if (b.dataset.tall) { tidyAll(b.dataset.tall); openTidy(); return true; }
+  const r = recs.find(x => x.id === b.dataset.tid); if (!r) return true;
+  if (b.dataset.tskip) {
+    r.tidySkip = [...new Set([...(r.tidySkip || []), b.dataset.tskip])]; saveRecs(); openTidy(); return true;
+  }
+  const k = b.dataset.tfix;
+  if (k === 'release') {
+    const box = $('#tv-' + CSS.escape(r.id));
+    if (box.innerHTML) { box.innerHTML = ''; return true; }
+    showVersions(r, r.masterId || r.dId, box, () => { toast('Utgåvan är vald'); openTidy(); render(); });
+    return true;
+  }
+  b.disabled = true; b.innerHTML = '<span class="spin"></span>';
+  try {
+    const ok = await tidyFix(r, k);
+    if (!ok) toast(k === 'spotify' ? 'Hittade inget album i Spotify. Öppna skivan och välj själv.'
+      : 'Discogs har inte den uppgiften. Raden är dold.', 4000);
+    render();
+  } catch (err) { toast(err.message, 4000); }
+  if (tidyOpen()) openTidy();
+  return true;
+}
+
+/* ---------------- Avdelare för hyllan ----------------
+   Delar Har-skivorna i fack med ungefär lika många skivor (i samma ordning som backen), eller per genre
+   eller decennium. Ger etiketter som "A – Bj" att skriva ut eller dela. */
+const divCfg = LS.get('sh.div', { mode: 'letter', n: 0 });
+const divKey = r => String(sortName(r) || '').trim().toLocaleUpperCase('sv');
+// Kortaste början av a som skiljer sig från b (t.ex. "BJÖRK" mot "BLONDIE" → "BJ").
+function divPrefix(a, b) {
+  for (let i = 1; i <= a.length; i++) if (a.slice(0, i) !== b.slice(0, i)) return a.slice(0, i).trim();
+  return a;
+}
+const divLabelCase = s => s.charAt(0) + s.slice(1).toLocaleLowerCase('sv');
+// Delar en sorterad lista i n fack. Gränsen flyttas till närmaste artistbyte (högst 15 % av ett fack bort),
+// så att en artist inte delas mellan två fack om det går att undvika.
+function divChunks(list, n) {
+  n = Math.max(1, Math.min(n, list.length));
+  const size = list.length / n, w = Math.floor(size * 0.15), cuts = [0];
+  for (let k = 1; k < n; k++) {
+    const t = Math.round(k * size);
+    let best = t;
+    for (let d = 0; d <= w; d++) {
+      const hit = [t - d, t + d].find(j => j > cuts[cuts.length - 1] && j < list.length && divKey(list[j - 1]) !== divKey(list[j]));
+      if (hit != null) { best = hit; break; }
+    }
+    if (best > cuts[cuts.length - 1]) cuts.push(best);
+  }
+  cuts.push(list.length);
+  return cuts.slice(1).map((c, i) => list.slice(cuts[i], c));
+}
+function divSections() {
+  const have = sortRecs(recs.filter(r => r.status === 'have'));
+  if (!have.length) return [];
+  if (divCfg.mode === 'letter') {
+    const chunks = divChunks(have, divCfg.n || Math.max(1, Math.round(have.length / 70)));
+    return chunks.map((c, i) => {
+      const a = divKey(c[0]), z = divKey(c[c.length - 1]);
+      const from = i ? divPrefix(a, divKey(chunks[i - 1][chunks[i - 1].length - 1])) : a.charAt(0);
+      const to = i < chunks.length - 1 ? divPrefix(z, divKey(chunks[i + 1][0])) : z.charAt(0);
+      const f = divLabelCase(from.slice(0, 18)), t = divLabelCase(to.slice(0, 18));
+      return { label: f === t ? f : `${f} – ${t}`, list: c };
+    });
+  }
+  const keyOf = divCfg.mode === 'genre' ? r => r.genre?.[0] || 'Övrigt' : r => decOf(r) || 'Okänt år';
+  const m = new Map();
+  for (const r of have) { const k = keyOf(r); if (!m.has(k)) m.set(k, []); m.get(k).push(r); }
+  const keys = [...m.keys()].sort((a, b) => divCfg.mode === 'dec'
+    ? (a === 'Okänt år') - (b === 'Okänt år') || a.localeCompare(b)
+    : (a === 'Övrigt') - (b === 'Övrigt') || cmpSv(a, b));
+  return keys.map(k => ({ label: k, list: m.get(k) }));
+}
+const divRange = list => {
+  const a = list[0].artist, z = list[list.length - 1].artist;
+  return a === z ? a : `${a} … ${z}`;
+};
+function openDivide() {
+  const have = recs.filter(r => r.status === 'have').length;
+  const n = divCfg.n || Math.max(1, Math.round(have / 70));
+  const secs = have ? divSections() : [];
+  $('#statsBody').innerHTML = `<div id="divView">
+    <div class="row"><button id="tidyBack">‹ Statistik</button><h2 style="flex:1;text-align:center">Avdelare</h2><button id="closeStats">Stäng</button></div>
+    <p class="note">Var ska avdelarna stå i hyllan? Appen delar dina ${have} skivor (i samma ordning som i backen) så att
+      facken blir ungefär lika fulla, och undviker att dela en artist mellan två fack.</p>
+    <div class="split" style="margin-top:10px;grid-template-columns:1fr 1fr 1fr">
+      ${[['letter', 'Bokstav'], ['genre', 'Genre'], ['dec', 'Decennium']].map(([v, l]) =>
+        `<button data-dmode="${v}" class="${divCfg.mode === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+    ${divCfg.mode === 'letter' ? `<label class="f">Antal fack (ett Kallax-fack rymmer ca 70 LP)</label>
+      <div class="inl"><input id="divN" type="number" inputmode="numeric" min="1" max="200" value="${n}">
+        <button id="divMinus">−</button><button id="divPlus">+</button></div>` : ''}
+    <div class="actions"><button id="divPrint">Skriv ut etiketter</button><button id="divShare">Dela som text</button></div>
+    <div class="rlist" style="margin-top:12px">${secs.map((s, i) => `
+      <div class="ri" style="cursor:default"><div class="ph" style="font-size:13px;font-weight:700">${i + 1}</div>
+        <div style="min-width:0"><div class="t" style="margin:0;font-size:17px">${esc(s.label)}</div>
+          <div class="m">${esc(divRange(s.list))}</div></div>
+        <div class="x">${s.list.length}<div class="m">skivor</div></div></div>`).join('') || '<p class="msg">Inga skivor under Har än.</p>'}</div>
+  </div>`;
+  $('#statsSheet').classList.add('open');
+}
+function divText() {
+  const secs = divSections();
+  return `Avdelare för skivhyllan (${secs.length} st)\n\n` + secs.map((s, i) =>
+    `${i + 1}. ${s.label} – ${s.list.length} skivor (${divRange(s.list)})`).join('\n');
+}
+function divPrintHtml() {
+  const secs = divSections();
+  return `<!doctype html><html lang="sv"><head><meta charset="utf-8"><title>Avdelare</title><style>
+    @page{size:A4;margin:12mm}
+    body{font-family:Georgia,'Times New Roman',serif;color:#111;margin:0}
+    .g{display:grid;grid-template-columns:1fr 1fr;gap:6mm}
+    .c{border:1px dashed #999;border-radius:3mm;height:60mm;padding:6mm;box-sizing:border-box;display:flex;flex-direction:column;
+       justify-content:space-between;break-inside:avoid}
+    .l{font-size:34pt;font-weight:700;line-height:1.05;word-break:break-word}
+    .m{font:10pt system-ui,sans-serif;color:#555}
+    .n{font:600 10pt system-ui,sans-serif;color:#999}
+  </style></head><body><div class="g">${secs.map((s, i) => `<div class="c"><div class="n">${divCfg.mode === 'letter' ? 'Fack' : 'Avdelare'} ${i + 1}</div>
+    <div class="l">${esc(s.label)}</div><div class="m">${esc(divRange(s.list))} · ${s.list.length} skivor</div></div>`).join('')}
+  </div></body></html>`;
+}
+function divPrint() {
+  const html = divPrintHtml();
+  // Android-appen (v8) skriver ut med telefonens utskriftstjänst (eller sparar som PDF).
+  if (nativeVer() >= 8) { App.print(html, 'Avdelare för skivhyllan'); return; }
+  if (nativeVer()) { toast('Installera senaste appen från GitHub för att skriva ut. Under tiden: Dela som text.', 4500); return; }
+  const f = document.createElement('iframe');
+  f.style.cssText = 'position:fixed;width:0;height:0;border:0;right:0;bottom:0';
+  f.onload = () => { try { f.contentWindow.print(); } catch { toast('Kunde inte skriva ut.'); } setTimeout(() => f.remove(), 60000); };
+  f.srcdoc = html;
+  document.body.appendChild(f);
+}
+function divClick(e) {
+  const b = e.target.closest('[data-dmode],#divMinus,#divPlus,#divPrint,#divShare');
+  if (!b) return false;
+  const have = recs.filter(r => r.status === 'have').length;
+  const n = divCfg.n || Math.max(1, Math.round(have / 70));
+  if (b.dataset.dmode) divCfg.mode = b.dataset.dmode;
+  else if (b.id === 'divMinus') divCfg.n = Math.max(1, n - 1);
+  else if (b.id === 'divPlus') divCfg.n = Math.min(200, n + 1);
+  else if (b.id === 'divPrint') { divPrint(); return true; }
+  else if (b.id === 'divShare') { shareText(divText(), 'Avdelare för skivhyllan'); return true; }
+  LS.set('sh.div', divCfg); openDivide();
+  return true;
+}
+$('#statsSheet').addEventListener('change', e => {
+  if (e.target.id !== 'divN') return;
+  const v = Math.round(+e.target.value);
+  divCfg.n = v >= 1 ? Math.min(200, v) : 0; LS.set('sh.div', divCfg);
+  setTimeout(openDivide);   // inte mitt i change/blur, då ritas rutan om medan den byts ut
+});
+
+/* ---------------- Genvägar på appikonen ----------------
+   Långtryck på appikonen (Android-skal v8) öppnar appen med ett av de här valen. */
+window.__go = what => {
+  closeStats(); if ($('#detail').classList.contains('open')) closeDetail();
+  if (shopOpen()) closeShop();
+  if (what === 'shop') openShop();
+  else if (what === 'covers') {
+    if (!$('#addView').classList.contains('open')) openAdd(view.tab === 'want' ? 'want' : 'have');
+    startCovers();
+  } else if (what === 'random') {
+    if ($('#addView').classList.contains('open')) closeAdd();
+    $('#btnRandom').click();
+  }
+};
+
 /* ---------------- Dela önskelistan ---------------- */
 // Önskelistan som text (sorterad som i backen), med utgåva och ungefärligt pris på Discogs.
 function wantsText() {
@@ -2853,14 +3138,14 @@ function wantsText() {
   });
   return `Min önskelista – vinyl (${want.length} st)\n\n${lines.join('\n')}\n\nPriser enligt Discogs ${new Date().toLocaleDateString('sv-SE')}.`;
 }
-async function shareWants() {
-  const text = wantsText();
-  // Android-appen (v5) öppnar telefonens dela-meny. I en webbläsare: navigator.share, annars urklipp.
-  if (nativeVer() >= 5) { App.share(text, 'Min önskelista'); return; }
+const shareWants = () => shareText(wantsText(), 'Min önskelista');
+// Android-appen (v5) öppnar telefonens dela-meny. I en webbläsare: navigator.share, annars urklipp.
+async function shareText(text, title) {
+  if (nativeVer() >= 5) { App.share(text, title); return; }
   try {
-    if (navigator.share) { await navigator.share({ title: 'Min önskelista', text }); return; }
+    if (navigator.share) { await navigator.share({ title, text }); return; }
   } catch (e) { if (e.name === 'AbortError') return; }
-  try { await navigator.clipboard.writeText(text); toast('Önskelistan är kopierad – klistra in den där du vill dela den.', 4000); }
+  try { await navigator.clipboard.writeText(text); toast('Texten är kopierad – klistra in den där du vill dela den.', 4000); }
   catch { toast('Kunde inte dela. Installera senaste appversionen från GitHub (Releases).', 4000); }
 }
 
@@ -2921,7 +3206,10 @@ function openStats(focus) {
       <div class="kpi"><b>${want.length}</b><span>vill ha</span></div>
       <div class="kpi"><b>${loans.length}</b><span>utlånade</span></div>
     </div>
-    ${want.length ? '<div class="actions" style="margin-top:8px"><button id="stShare">Dela önskelistan</button></div>' : ''}
+    <div class="actions" style="margin-top:8px">
+      <button id="stTidy">Städa samlingen${(() => { const n = recs.filter(r => TIDY.some(t => tidyMissing(r, t))).length; return n ? ` (${n} att se över)` : ''; })()}</button>
+      <button id="stDivide">Avdelare för hyllan</button>
+      ${want.length ? '<button id="stShare">Dela önskelistan</button>' : ''}</div>
     <div class="kpi" style="margin-top:8px"><span>Samlingens värde (${esc(condShort(cfg.cond || 'Very Good Plus (VG+)'))})</span><b>${total}</b>
       <span>${valued.length} av ${have.length} värderade</span>
       ${whPts.length >= 2 ? sparkSvg(whPts) + `<span>Sedan ${esc(new Date(whPts[0].t).toLocaleDateString('sv-SE'))}: ${money(whPts[0].v, whC)} → ${money(whPts[whPts.length - 1].v, whC)}</span>` : '<span style="display:block;margin-top:4px">Grafen fylls på allt eftersom priserna uppdateras.</span>'}

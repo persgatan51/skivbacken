@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Tärning (genväg: Slumpa en skiva) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp" android:height="48dp" android:viewportWidth="48" android:viewportHeight="48">
+    <path android:fillColor="#0F1115" android:pathData="M24,0a24,24 0 1,0 0.01,0z" />
+    <path android:fillColor="#E5B84B" android:pathData="M15,13h18a2,2 0 0,1 2,2v18a2,2 0 0,1 -2,2h-18a2,2 0 0,1 -2,-2v-18a2,2 0 0,1 2,-2z" />
+    <path android:fillColor="#0F1115" android:pathData="M18.5,16.5a2,2 0 1,0 0.01,0z M29.5,16.5a2,2 0 1,0 0.01,0z M24,22a2,2 0 1,0 0.01,0z M18.5,27.5a2,2 0 1,0 0.01,0z M29.5,27.5a2,2 0 1,0 0.01,0z" />
+</vector>

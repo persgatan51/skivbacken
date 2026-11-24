@@ -2,7 +2,10 @@ package se.persgatan.skivhyllan
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
+import android.print.PrintAttributes
+import android.print.PrintManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
@@ -51,7 +54,9 @@ import java.util.concurrent.Executors
  *  - App.captureScan(): som capturePhoto, men streckkod och text läses direkt i telefonen (v7),
  *  - App.capturePhoto(): kameran direkt, med fotot tillbaka som base64 (snabbläget fotar skiva efter skiva
  *    utan att man behöver trycka mellan fotona),
- *  - att appen laddar om sidan i stället för att stängas om WebViews ritprocess kraschar.
+ *  - att appen laddar om sidan i stället för att stängas om WebViews ritprocess kraschar,
+ *  - App.print(): skriver ut en HTML-sida med telefonens utskriftstjänst eller som PDF (v8),
+ *  - genvägar på appikonen (res/xml/shortcuts.xml), som öppnar t.ex. butiksläget direkt (v8).
  *
  * Bryggan App.* svarar bara när sidan som visas är webbappen (inte t.ex. Spotifys inloggningssidor).
  */
@@ -83,6 +88,9 @@ class MainActivity : Activity() {
     private var camUri: Uri? = null
     // Värd för sidan som visas just nu. Bryggan används bara när det är webbappen.
     @Volatile private var pageHost: String? = null
+    // Genväg från appikonen (skivbacken://go/shop) som webbappen ska öppna när sidan är laddad.
+    private var pendingGo: String? = null
+    private var printWeb: WebView? = null   // hålls kvar medan utskriften pågår
     private val barcodeScanner by lazy {
         BarcodeScanning.getClient(
             BarcodeScannerOptions.Builder().setBarcodeFormats(
@@ -94,6 +102,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingGo = goOf(intent)
         createWeb()
         // Fotot som kameran skulle spara, om appen stängts av Android medan kameran var öppen.
         savedInstanceState?.getString("photoUri")?.let { photoUri = Uri.parse(it) }
@@ -101,6 +110,45 @@ class MainActivity : Activity() {
         // restoreState ger null om det sparade tillståndet inte gick att återställa; ladda då sidan på nytt
         // i stället för att visa en vit skärm.
         if (savedInstanceState == null || web.restoreState(savedInstanceState) == null) loadStart()
+    }
+
+    // singleTask: trycker man på en genväg när appen redan är igång kommer den hit i stället för onCreate.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        goOf(intent)?.let { pendingGo = it; deliverGo() }
+    }
+    private fun goOf(i: Intent?): String? {
+        val d = i?.data ?: return null
+        return if (d.scheme == "skivbacken" && d.host == "go") d.lastPathSegment?.takeIf { it in setOf("shop", "covers", "random") } else null
+    }
+    // Ger genvägen till webbappen. Finns inte window.__go än (sidan laddas) försöker onPageFinished igen.
+    private fun deliverGo() {
+        val go = pendingGo ?: return
+        if (pageHost != HOST) return
+        web.evaluateJavascript("window.__go ? (window.__go('$go'), 'ok') : 'no'") { r ->
+            if (r?.contains("ok") == true && pendingGo == go) pendingGo = null
+        }
+    }
+
+    private fun printHtml(html: String, title: String) {
+        val wv = WebView(this)   // JavaScript är avstängt i den här WebView:n; den visar bara utskriften
+        printWeb = wv
+        var started = false
+        wv.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String?) {
+                if (started) return
+                started = true
+                try {
+                    val pm = getSystemService(Context.PRINT_SERVICE) as PrintManager
+                    pm.print(title, view.createPrintDocumentAdapter(title),
+                        PrintAttributes.Builder().setMediaSize(PrintAttributes.MediaSize.ISO_A4).build())
+                } catch (e: Exception) {
+                    Toast.makeText(this@MainActivity, "Kunde inte skriva ut", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        wv.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
     }
 
     private val crashTimes = mutableListOf<Long>()
@@ -142,6 +190,9 @@ class MainActivity : Activity() {
             }
             override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
                 pageHost = url?.let { Uri.parse(it).host }
+            }
+            override fun onPageFinished(view: WebView, url: String?) {
+                if (view === web) deliverGo()
             }
             // WebViews ritprocess har kraschat eller stängts av Android (oftast för att minnet tog slut).
             // Utan detta stänger Android hela appen. Skapa en ny WebView och ladda sidan igen.
@@ -463,7 +514,7 @@ class MainActivity : Activity() {
         // Bara webbappen får använda bryggan, inte andra sidor som visas i appen (t.ex. Spotifys inloggning).
         private fun trusted() = pageHost == HOST
 
-        @JavascriptInterface fun version(): String = if (trusted()) "7" else "0"
+        @JavascriptInterface fun version(): String = if (trusted()) "8" else "0"
 
         /** mode: "auto" = bara om en fil redan är vald, "save" = samma fil som förut (annars välj), "pick" = välj ny plats. */
         @JavascriptInterface fun saveBackup(json: String, id: String, mode: String) {
@@ -533,6 +584,10 @@ class MainActivity : Activity() {
          *  img: JPEG i base64, längsta sida 1024 px }, "cancel" eller ett fel. */
         @JavascriptInterface fun captureScan(id: String) {
             if (trusted()) runOnUiThread { startCapture(id, 3000, true) }
+        }
+        /** Skriver ut en HTML-sida (t.ex. etiketter till hyllans avdelare) med telefonens utskriftstjänst (v8). */
+        @JavascriptInterface fun print(html: String, title: String) {
+            if (trusted()) runOnUiThread { printHtml(html, title.take(60)) }
         }
         /** Öppnar telefonens dela-meny med en text (v5). */
         @JavascriptInterface fun share(text: String, title: String) {

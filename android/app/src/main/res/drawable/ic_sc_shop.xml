@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Förstoringsglas (genväg: Har jag den?) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp" android:height="48dp" android:viewportWidth="48" android:viewportHeight="48">
+    <path android:fillColor="#0F1115" android:pathData="M24,0a24,24 0 1,0 0.01,0z" />
+    <path android:fillColor="#00000000" android:strokeColor="#E5B84B" android:strokeWidth="3.5"
+        android:pathData="M21,12a9,9 0 1,0 0.01,0z" />
+    <path android:fillColor="#00000000" android:strokeColor="#E5B84B" android:strokeWidth="4"
+        android:strokeLineCap="round" android:pathData="M27.5,27.5L35,35" />
+</vector>

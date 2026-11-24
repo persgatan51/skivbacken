@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Genvägar på appikonen (långtryck). Korta namn syns i menyn, långa där det får plats. -->
+    <string name="sc_shop">Har jag den?</string>
+    <string name="sc_shop_long">Har jag den? – skanna i butiken</string>
+    <string name="sc_covers">Fota många</string>
+    <string name="sc_covers_long">Fota många skivor i rad</string>
+    <string name="sc_random">Slumpa en skiva</string>
+    <string name="sc_random_long">Slumpa en skiva ur backen</string>
+</resources>

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Genvägar på appikonen. MainActivity läser skivbacken://go/<val> och ber webbappen öppna rätt vy (window.__go). -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="shop"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_shop"
+        android:shortcutShortLabel="@string/sc_shop"
+        android:shortcutLongLabel="@string/sc_shop_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:data="skivbacken://go/shop"
+            android:targetPackage="se.persgatan.skivhyllan"
+            android:targetClass="se.persgatan.skivhyllan.MainActivity" />
+    </shortcut>
+    <shortcut
+        android:shortcutId="covers"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_camera"
+        android:shortcutShortLabel="@string/sc_covers"
+        android:shortcutLongLabel="@string/sc_covers_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:data="skivbacken://go/covers"
+            android:targetPackage="se.persgatan.skivhyllan"
+            android:targetClass="se.persgatan.skivhyllan.MainActivity" />
+    </shortcut>
+    <shortcut
+        android:shortcutId="random"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_dice"
+        android:shortcutShortLabel="@string/sc_random"
+        android:shortcutLongLabel="@string/sc_random_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:data="skivbacken://go/random"
+            android:targetPackage="se.persgatan.skivhyllan"
+            android:targetClass="se.persgatan.skivhyllan.MainActivity" />
+    </shortcut>
+</shortcuts>
