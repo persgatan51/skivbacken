@@ -181,6 +181,30 @@
   .shop .codeRow{display:flex;gap:8px;margin-top:10px}
   .spark path.l{fill:none;stroke:var(--acc);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
   .spark path.a{fill:var(--acc);opacity:.12}
+  #tonight{margin-top:8px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:8px 10px}
+  .tn-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .tn-h b{flex:1;min-width:0}
+  .tn-h button{padding:5px 10px;font-size:13px}
+  .tn-l{display:flex;gap:6px;overflow-x:auto;margin-top:6px;padding-bottom:2px}
+  .tn-l button{flex:none;width:44px;height:44px;padding:0;border-radius:6px;overflow:hidden;border:0;background:var(--bg)}
+  .tn-l img{width:100%;height:100%;object-fit:cover;display:block}
+  .tn-l button.done{opacity:.35}
+  .np{z-index:30}
+  .np-cover{width:min(100%,360px,46vh);aspect-ratio:1/1;object-fit:cover;display:flex;margin:4px auto 0;border-radius:10px;background:var(--card)}
+  .np-t{text-align:center;margin:14px 0 2px;font-size:22px}
+  .np-a{text-align:center;color:var(--mut)}
+  .np-s{display:flex;gap:6px;justify-content:center;flex-wrap:wrap;margin-top:12px}
+  .np-s button.on{background:var(--acc);color:#111;border-color:var(--acc)}
+  .np-p{margin-top:12px;text-align:center}
+  .np-bar{height:6px;border-radius:3px;background:var(--card);overflow:hidden;margin-bottom:6px}
+  .np-bar i{display:block;height:100%;background:var(--acc)}
+  .np-flip{display:flex;flex-direction:column;align-items:center;gap:8px;padding:12px;border-radius:12px;background:var(--acc);color:#111;font-size:18px}
+  .np-flip button{font-weight:700;background:#111;color:var(--acc);border-color:#111}
+  #npTr .tr.on{color:var(--acc);font-weight:700}
+  .runout{margin-top:8px;padding:10px;border-radius:12px;background:var(--card);border:1px solid var(--line)}
+  .runout label.f{margin-top:0}
+  .runout .roIn{text-transform:uppercase}
+  .roCam{padding:9px 12px;border-radius:10px;border:1px solid var(--line);background:var(--bg);cursor:pointer}
 </style>
 </head>
 <body>
@@ -199,6 +223,7 @@
     <button data-tab="all">Alla</button>
   </div>
   <div id="worth"></div>
+  <div id="tonight" hidden></div>
   <div class="tools" id="searchRow" hidden>
     <input id="filter" type="search" placeholder="Sök artist, album eller låt" autocomplete="off">
     <div class="filters">
@@ -268,6 +293,8 @@
 <div class="sheet" id="statsSheet"><div class="panel"><div class="pad st" id="statsBody"></div></div></div>
 
 <div class="sheet" id="detail"><div class="panel" id="detailBody"></div></div>
+
+<div class="view np" id="npView"></div>
 
 <div class="sheet" id="settings"><div class="panel"><div class="pad">
   <h2>Inställningar</h2>
@@ -706,19 +733,41 @@ async function showVersions(r, masterId, box = $('#dVersList'), done = () => dra
   try {
     const j = await dg(`/masters/${masterId}/versions`, { per_page: 100, sort: 'released', sort_order: 'asc' });
     const vs = (j.versions || []);
-    box.innerHTML = `<p class="note">Välj den pressning du har (${vs.length} st):</p>` + vs.map((x, i) => `
+    box.innerHTML = (vs.length > 1 ? `<div class="runout">
+        <label class="f">Osäker? Skriv texten som är inristad i dödvaxet (mellan spåren och etiketten), t.ex. <i>YEX 773-1</i>. Flera sidor skiljs med /.</label>
+        <div class="inl"><input class="roIn" enterkeyhint="search" autocomplete="off" autocapitalize="characters" placeholder="Text i dödvaxet">
+          ${window.App?.scan ? '<label class="roCam" aria-label="Fota dödvaxet">📷<input type="file" accept="image/*" capture="environment" hidden></label>' : ''}
+          <button class="roGo">Hitta</button></div>
+        <div class="roRes"></div></div>` : '')
+      + `<p class="note">Välj den pressning du har (${vs.length} st):</p>` + vs.map((x, i) => `
       <div class="cand" data-i="${i}" style="cursor:pointer">
         ${x.thumb ? `<img src="${esc(x.thumb)}" alt="">` : '<div class="ph">♪</div>'}
         <div><div class="t">${esc([x.format, x.country, x.released].filter(Boolean).join(' · '))}</div>
           <div class="m">${esc([x.label, x.catno].filter(Boolean).join(' · '))}</div>
           ${x.id === r.rid ? '<div class="m" style="color:var(--acc)">Vald nu</div>' : ''}</div></div>`).join('');
     box.onclick = e => {
+      if (e.target.closest('.roGo')) { roSearch(r, vs, box); return; }
+      const more = e.target.closest('.roMore'); if (more) { roSearch(r, vs, box, +more.dataset.n); return; }
       const el = e.target.closest('.cand'); if (!el) return;
       const x = vs[+el.dataset.i];
+      box.dataset.ro = '';   // en pågående dödvax-sökning behövs inte längre
       r.rid = x.id;
       r.relLabel = [x.format, x.country, x.released, x.catno].filter(Boolean).join(' · ');
       // Ny utgåva = nytt pris och ny historik.
       r.price = null; delete r.priceErr; delete r.priceHist; saveRecs(); done();
+    };
+    const ro = box.querySelector('.roIn');
+    if (ro) ro.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); roSearch(r, vs, box); } };
+    // Foto av dödvaxet: telefonen läser texten (ML Kit). Den blir sällan perfekt, så den går att rätta före sökningen.
+    const cam = box.querySelector('.roCam input');
+    if (cam) cam.onchange = async () => {
+      const f = cam.files[0]; cam.value = ''; if (!f) return;
+      box.querySelector('.roRes').innerHTML = '<p class="note"><span class="spin"></span>Läser texten…</p>';
+      const sc = await scanPhoto(f);
+      const lines = (sc.lines || []).map(l => String(l).trim()).filter(l => /[A-Z0-9]{3}/i.test(l) && l.length <= 40).slice(0, 4);
+      box.querySelector('.roRes').innerHTML = lines.length ? '<p class="note">Rätta texten om något blev fel och tryck Hitta.</p>'
+        : '<p class="note">Kunde inte läsa någon text. Prova med mer ljus snett från sidan, eller skriv av den.</p>';
+      if (lines.length) { ro.value = lines.join(' / '); ro.focus(); }
     };
   } catch (e) { box.innerHTML = `<div class="m">${esc(e.message)}</div>`; }
 }
@@ -799,6 +848,7 @@ function render() {
   document.querySelectorAll('[data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === view.tab));
   $('#btnView').textContent = view.mode === 'crate' ? '▦' : '▤';
   updateWorth();
+  drawTonight();
   $('#crateView').hidden = view.mode !== 'crate';
   $('#gridView').hidden = view.mode === 'crate';
 
@@ -1636,6 +1686,10 @@ function drawDetail() {
       ${r.lastPlayed ? `<div class="m">Senast spelad ${esc(new Date(r.lastPlayed).toLocaleDateString('sv-SE'))}</div>` : ''}
       <div class="actions">
         <button class="play" id="dPlay">▶ Spela i Spotify</button>
+        ${r.status === 'have' ? `<div class="split">
+          <button id="dSpin">💿 Nu spelas</button>
+          <button id="dTonight" class="${inTonight(r.id) ? 'on' : ''}">${inTonight(r.id) ? '✓ I kvällens kö' : '🌙 Kvällens kö'}</button>
+        </div>` : ''}
         <div class="split">
           <button id="dHave" class="${r.status === 'have' ? 'on' : ''}">Har den</button>
           <button id="dWant" class="${r.status === 'want' ? 'on' : ''}">Vill ha</button>
@@ -1654,6 +1708,12 @@ function drawDetail() {
       </div>
     </div>`;
   $('#dPlay').onclick = () => playAlbum(r);
+  if ($('#dSpin')) $('#dSpin').onclick = () => openNowPlaying(r);
+  if ($('#dTonight')) $('#dTonight').onclick = () => {
+    toggleTonight(r);
+    $('#dTonight').classList.toggle('on', inTonight(r.id));
+    $('#dTonight').textContent = inTonight(r.id) ? '✓ I kvällens kö' : '🌙 Kvällens kö';
+  };
   const showSort = () => { $('#dSort').textContent = sortName(r); $('#dSortBtn').textContent = sortName(r) === surname(r.artist) && surname(r.artist) !== r.artist ? 'sortera på förnamn' : 'sortera på efternamn'; };
   if ($('#dSortBtn')) showSort(); else $('#dSort').textContent = sortName(r);
   if ($('#dSortBtn')) $('#dSortBtn').onclick = e => {
@@ -1708,6 +1768,7 @@ function markDeleted(id) {
 }
 function setStatus(s) {
   cur.status = s; saveRecs(); render(); drawLoan(cur); drawValue(cur);
+  if (!!$('#dSpin') !== (s === 'have')) { const y = $('#detail .panel').scrollTop; drawDetail(); $('#detail .panel').scrollTop = y; }
   $('#dHave').classList.toggle('on', s === 'have'); $('#dWant').classList.toggle('on', s === 'want');
   toast(s === 'have' ? 'Flyttad till Har' : 'Flyttad till Vill ha');
 }
@@ -1799,7 +1860,8 @@ async function spAlbums(r) {
   if (!items.length) { j = await spGet('/search?type=album&limit=10&q=' + encodeURIComponent(`${r.artist} ${r.title}`)); if (!j) return null; items = j.albums?.items || []; }
   return items;
 }
-// Returnerar 'net' om Spotify inte gick att nå, så att matchAll kan pausa i stället för att gå igenom alla skivor.
+// Returnerar 'net' om Spotify inte gick att nå, så att matchAll kan pausa i stället för att gå igenom alla skivor,
+// och 'err' vid andra fel (för många anrop, serverfel), så att skivan inte räknas som "inget album".
 async function matchSpotify(r) {
   if (!sp) return;
   try {
@@ -1813,9 +1875,9 @@ async function matchSpotify(r) {
     else r.spTried = Date.now();
     saveRecs({ bg: true });
     if (cur === r) { const el = $('#dSp'); if (el) el.textContent = r.spotifyName ? 'Spotify: ' + r.spotifyName : ''; }
-  } catch (e) { if (e.net) return 'net'; }
+  } catch (e) { return e.net ? 'net' : 'err'; }   // 'err' = t.ex. 429 eller 5xx: inte "ingen träff"
 }
-function markPlayed(r) { r.lastPlayed = Date.now(); saveRecs({ bg: true }); }
+function markPlayed(r) { r.lastPlayed = Date.now(); saveRecs({ bg: true }); tonightMark(r); }
 function playAlbum(r) {
   markPlayed(r);
   if (r.spotifyId) openUrl('https://open.spotify.com/album/' + r.spotifyId);
@@ -1865,6 +1927,8 @@ async function matchAll() {
       if (!recs.includes(r) || r.spotifyId) continue;
       // Pausa medan en skiva är öppen, så att Spotify-kvoten räcker till det du gör just då.
       while (sp && $('#detail').classList.contains('open')) await sleepMs(3000);
+      // Kör "Städa samlingen" Spotify-matchningen just nu väntar bakgrunden, så att de inte delar på kvoten.
+      while (sp && tidy.busy === 'spotify') await sleepMs(3000);
       // Inget nät: sluta här. matchAll körs igen när bakgrundsjobbet är klart (t.ex. när nätet är tillbaka).
       if ((await matchSpotify(r)) === 'net') break;
       await sleepMs(400);
@@ -1914,8 +1978,15 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-24b';
+const WEB_VERSION = '2026-11-25';
 const CHANGELOG = [
+  { d: '2026-11-25', t: 'Kvällens skivor, Nu spelas och hitta din pressning', i: [
+    'Ny: "Kvällens kö" i skivans detaljvy. Plocka fram skivorna du vill spela ikväll; de visas överst med total speltid, och spelade skivor bockas av. Kön töms av sig själv efter ett dygn.',
+    'Ny: "Nu spelas" visar omslaget stort med låtlistan för sidan du spelar. Tryck när nålen går ner, så markeras låten som spelas och appen säger till (och vibrerar) när det är dags att vända. Skärmen hålls tänd (kräver nya appen från GitHub, Android-skal v9).',
+    'Ny: hitta exakt pressning med texten i dödvaxet. Under "Välj exakt utgåva" (och i Städa samlingen) skriver eller fotar du det som är inristat nära etiketten, så jämför appen med Discogs uppgifter.',
+    'Rättat: "Hämta alla" för Spotify i Städa samlingen kunde dölja skivor som "inget album" när Spotify hade för mycket att göra. Nu stannar den i stället, och väntar lite mellan skivorna.',
+    'Rättat: listan i Städa samlingen hoppar inte längre medan "Hämta alla" pågår, så att man inte trycker på fel skiva.',
+    'Rättat: en genväg från appikonen (t.ex. Fota många) körs inte igen när Android återställer appen eller den öppnas från senaste appar (nya appen).' ] },
   { d: '2026-11-24', t: 'Städa samlingen, avdelare och genvägar', i: [
     'Ny: "Städa samlingen" under 📊 visar skivor som saknar omslag, år eller genre, vald utgåva, Spotify-album eller pris, och hur stor del av samlingen som är komplett. Varje rad har en knapp som rättar det, "Hämta alla" tar en hel grupp i taget, och "Dölj" tar bort sådant som inte går att rätta.',
     'Ny: "Avdelare för hyllan" under 📊 räknar ut var avdelarna ska stå så att facken blir lika fulla (t.ex. "A – Bj", "Bl – Da"), eller per genre eller decennium. Etiketterna kan skrivas ut (eller sparas som PDF) eller delas som text.',
@@ -2831,6 +2902,303 @@ $('#btnRandom').onclick = () => {
   } else openDetail(r.id);
 };
 
+/* ---------------- Speltid ---------------- */
+// Discogs skriver speltid som "4:35" eller "1:02:03". Saknas den blir det 0.
+function durSec(d) {
+  const p = String(d || '').trim().split(':');
+  if (p.length < 2 || p.some(x => !/^\d+$/.test(x))) return 0;
+  return p.reduce((a, x) => a * 60 + +x, 0);
+}
+const fmtDur = s => { const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60); return h ? `${h} h ${m} min` : `${Math.max(1, m)} min`; };
+const fmtClock = s => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+const recSecs = r => (r.tracks || []).filter(t => !t.h).reduce((a, t) => a + durSec(t.d), 0);
+// Hämtar låtlistan direkt (förgrund) om den saknas. Används av kvällens kö och "Nu spelas".
+async function ensureTracks(r) {
+  if (r.tracks || !r.dId) return;
+  const j = await dg(r.dType === 'master' ? `/masters/${r.dId}` : `/releases/${r.dId}`);
+  if (applyInfo(r, j)) scheduleRender(true);
+  if (!r.tracks) r.tracks = [];
+  saveRecs({ bg: true });
+}
+// Hoppar fram till en skiva i backen: nästan hela vägen direkt, de sista skivorna med animation
+// (samma knep som Slumpa, så att inte hundratals omslag laddas på vägen).
+function crateJump(id) {
+  const i = crate.idx.get(id); if (i == null) return false;
+  crate.target = null;
+  if (Math.abs(i - crate.pos) > 12) { crate.pos = clampPos(i + (i >= crate.pos ? -12 : 12)); crateDraw(true); }
+  crateGo(i);
+  return true;
+}
+
+/* ---------------- Kvällens skivor ----------------
+   En liten lyssningskö: skivor man plockat fram inför kvällen, med total speltid. Ligger bara i telefonen
+   (inte i backupen) och töms av sig själv när den inte rörts på ett dygn. */
+const TONIGHT_EMPTY = () => ({ at: 0, ids: [], done: [] });
+let tonight = LS.get('sh.tonight', null) || TONIGHT_EMPTY();
+function tonightFresh() {
+  if (tonight.ids.length && Date.now() - tonight.at > 24 * 3600000) { tonight = TONIGHT_EMPTY(); LS.set('sh.tonight', tonight); }
+  return tonight;
+}
+const inTonight = id => tonightFresh().ids.includes(id);
+function saveTonight() { tonight.at = Date.now(); LS.set('sh.tonight', tonight); drawTonight(); }
+const tonightList = () => tonightFresh().ids.map(id => recs.find(r => r.id === id)).filter(Boolean);
+const tonightNext = () => tonightList().find(r => !tonight.done.includes(r.id));
+function toggleTonight(r) {
+  if (inTonight(r.id)) {
+    tonight.ids = tonight.ids.filter(x => x !== r.id); tonight.done = tonight.done.filter(x => x !== r.id);
+    toast('Borttagen ur kvällens kö');
+  } else {
+    tonight.ids.push(r.id); tonight.done = tonight.done.filter(x => x !== r.id);
+    toast(`🌙 ${r.title} ligger i kvällens kö`);
+    if (!r.tracks && r.dId) ensureTracks(r).then(drawTonight, () => {});   // för speltiden
+  }
+  saveTonight();
+}
+// Kallas när en skiva spelas (Spotify eller "Nu spelas"): bocka av den i kön.
+function tonightMark(r) {
+  if (inTonight(r.id) && !tonight.done.includes(r.id)) { tonight.done.push(r.id); saveTonight(); }
+}
+function drawTonight() {
+  const box = $('#tonight'); if (!box) return;
+  const list = tonightList(), was = box.hidden;
+  box.hidden = !list.length;
+  if (list.length) {
+    const left = list.filter(r => !tonight.done.includes(r.id));
+    const secs = left.reduce((a, r) => a + recSecs(r), 0), unknown = left.filter(r => !recSecs(r)).length;
+    const info = !left.length ? 'alla spelade'
+      : `${left.length} kvar${secs ? ` · ca ${fmtDur(secs)}` : ''}${unknown && secs ? ` (+${unknown} utan speltid)` : ''}`;
+    setH(box, `<div class="tn-h"><b>🌙 Kvällens skivor</b>
+        ${left.length ? '<button data-tn="next">💿 Lägg på nästa</button>' : ''}
+        <button data-tn="clear" class="ico" aria-label="Töm kvällens kö">✕</button></div>
+      <div class="m">${info}</div>
+      <div class="tn-l">${list.map(r => `<button data-tnid="${esc(r.id)}" class="${tonight.done.includes(r.id) ? 'done' : ''}" aria-label="${esc(r.title)} – ${esc(r.artist)}">${
+        r.thumb || r.cover ? `<img src="${esc(r.thumb || r.cover)}" alt="" loading="lazy">` : '<span>♪</span>'}</button>`).join('')}</div>`);
+  }
+  if (was !== box.hidden) crateLayout();
+}
+$('#tonight').addEventListener('click', e => {
+  const b = e.target.closest('[data-tn],[data-tnid]'); if (!b) return;
+  if (b.dataset.tn === 'clear') {
+    if (!b.dataset.sure) { b.dataset.sure = 1; b.textContent = 'Töm?'; b.classList.remove('ico'); return; }
+    tonight = TONIGHT_EMPTY(); saveTonight(); toast('Kvällens kö är tömd'); return;
+  }
+  if (b.dataset.tn === 'next') { const r = tonightNext(); if (r) openNowPlaying(r); return; }
+  const id = b.dataset.tnid;
+  if (!(view.mode === 'crate' && crateJump(id))) openDetail(id);
+});
+
+/* ---------------- Nu spelas ----------------
+   Omslaget stort med låtlistan för sidan som spelas. Starta när nålen går ner: aktuell låt markeras, och när
+   sidans speltid har gått säger appen till att det är dags att vända. Skärmen hålls tänd (Android-skal v9,
+   annars Wake Lock i webbläsaren). */
+const np = { r: null, side: 0, start: 0, flipped: false, timer: 0, wake: null };
+const npOpen = () => $('#npView').classList.contains('open');
+// Delar låtlistan i sidor efter positionen (A1, A2, B1 …). Utan bokstäver blir det en enda sida.
+function npSides(r) {
+  const sides = [];
+  for (const t of (r.tracks || []).filter(x => !x.h)) {
+    const L = (/^([A-H])(?=\d|$|[.\-\s])/i.exec(String(t.p).trim()) || [])[1]?.toUpperCase() || '';
+    const last = sides[sides.length - 1];
+    if (last && (last.L === L || !L)) last.tracks.push(t);
+    else sides.push({ L, tracks: [t] });
+  }
+  if (!sides.length) return [];
+  if (sides.length === 1 && !sides[0].L) return [{ L: '', name: 'Hela skivan', tracks: sides[0].tracks }];
+  return sides.map(s => ({ ...s, name: s.L ? 'Sida ' + s.L : 'Sida ?' }));
+}
+const lowName = n => n.replace(/^Sida/, 'sida').replace(/^Hela/, 'hela');   // "sida A", inte "sida a"
+async function npAwake(on) {
+  if (nativeVer() >= 9) { try { App.keepAwake(on); } catch {} return; }
+  try {
+    if (on && navigator.wakeLock && document.visibilityState === 'visible') np.wake = await navigator.wakeLock.request('screen');
+    else if (!on && np.wake) { await np.wake.release(); np.wake = null; }
+  } catch {}
+}
+// Webbläsarens wake lock släpps när man lämnar sidan; ta den igen när man kommer tillbaka.
+document.addEventListener('visibilitychange', () => { if (npOpen() && document.visibilityState === 'visible' && nativeVer() < 9) npAwake(true); });
+function openNowPlaying(r) {
+  np.r = r; np.side = 0; np.start = 0; np.flipped = false;
+  markPlayed(r);
+  if ($('#detail').classList.contains('open')) closeDetail();
+  $('#npView').classList.add('open');
+  $('#npView').scrollTop = 0;
+  npAwake(true);
+  drawNp();
+  if (!r.tracks && r.dId) {
+    ensureTracks(r).then(() => { if (np.r === r) drawNp(); },
+      e => { if (np.r === r && $('#npTr')) $('#npTr').innerHTML = `<div class="msg">${esc(e.message)}</div>`; });
+  }
+  clearInterval(np.timer); np.timer = setInterval(npTick, 1000);
+}
+function closeNp() {
+  clearInterval(np.timer); np.timer = 0;
+  $('#npView').classList.remove('open'); $('#npView').innerHTML = '';
+  np.r = null; npAwake(false);
+}
+function drawNp() {
+  const r = np.r; if (!r) return;
+  const sides = npSides(r), s = sides[np.side];
+  const nxt = tonightNext();
+  $('#npView').innerHTML = `
+    <div class="row bar"><button id="npClose">‹ Tillbaka</button><div style="flex:1"></div>
+      ${inTonight(r.id) ? `<span class="m">🌙 ${tonightList().indexOf(r) + 1} av ${tonightList().length} i kvällens kö</span>` : ''}</div>
+    ${r.cover ? `<img class="np-cover" src="${esc(r.cover)}" alt="">` : '<div class="np-cover ph">♪</div>'}
+    <h2 class="np-t">${esc(r.title)}</h2>
+    <div class="np-a">${esc(r.artist)}${r.year ? ' · ' + esc(r.year) : ''}</div>
+    ${sides.length > 1 ? `<div class="np-s">${sides.map((x, i) => `<button data-side="${i}" class="${i === np.side ? 'on' : ''}">${esc(x.name)}</button>`).join('')}</div>` : ''}
+    <div id="npProg" class="np-p"></div>
+    <div class="tracks" id="npTr">${!r.tracks && r.dId ? '<div class="msg"><span class="spin"></span>Hämtar låtlistan…</div>'
+      : s ? s.tracks.map((t, i) => `<div class="tr" data-ti="${i}"><span class="p">${esc(t.p)}</span><span>${esc(t.t)}</span><span class="d">${esc(t.d)}</span></div>`).join('')
+        + '<p class="note">Hoppar du i skivan? Tryck på låten som spelas, så går klockan dit.</p>'
+      : '<div class="msg">Ingen låtlista hos Discogs.</div>'}</div>
+    <div class="actions">
+      ${s ? `<button id="npGo" class="play">${np.start ? '↺ Börja om ' + esc(lowName(s.name)) : '▶ Nålen är nere – starta ' + esc(lowName(s.name))}</button>` : ''}
+      ${nxt && nxt !== r ? `<button id="npNext">💿 Nästa i kvällens kö: ${esc(nxt.title)}</button>` : ''}
+    </div>`;
+  npTick();
+}
+// Skriver bara om när innehållet ändrats, så att en knapp inte byts ut mitt i ett tryck (tick varje sekund).
+function setH(el, html) { if (el && el._h !== html) { el.innerHTML = html; el._h = html; } }
+function npTick() {
+  const r = np.r, box = $('#npProg'); if (!r || !box) return;
+  if (!box.firstChild) box.innerHTML = '<div id="npBar"></div><div class="m" id="npClock"></div><div id="npAct"></div>';
+  const bar = $('#npBar'), clock = $('#npClock'), act = $('#npAct');
+  const sides = npSides(r), s = sides[np.side];
+  if (!s) { setH(bar, ''); setH(clock, ''); setH(act, ''); return; }
+  const total = s.tracks.reduce((a, t) => a + durSec(t.d), 0);
+  const known = s.tracks.every(t => durSec(t.d));
+  const more = np.side < sides.length - 1, nextName = more ? sides[np.side + 1].name : '';
+  if (!np.start) {
+    setH(bar, ''); setH(act, '');
+    setH(clock, `${total ? `${esc(s.name)} är ${known ? '' : 'minst '}${fmtClock(total)} lång.` : 'Speltid saknas hos Discogs.'} Tryck på knappen när nålen går ner.`);
+    return;
+  }
+  const el = (Date.now() - np.start) / 1000;
+  // Markera låten som spelas nu (räknat på speltiderna).
+  let acc = 0, curI = -1;
+  if (known) s.tracks.forEach((t, i) => { if (el >= acc) curI = i; acc += durSec(t.d); });
+  document.querySelectorAll('#npTr .tr').forEach((x, i) => x.classList.toggle('on', i === curI && el < total));
+  if (known && total && el >= total) {
+    const nxt = tonightNext();
+    if (!np.flipped) {
+      np.flipped = true;
+      try { navigator.vibrate?.([300, 150, 300]); } catch {}
+      toast(more ? `Dags att vända – ${lowName(nextName)}` : 'Skivan är slut', 5000);
+    }
+    setH(bar, ''); setH(clock, '');
+    setH(act, `<div class="np-flip">${more ? `<b>Dags att vända!</b><button data-sgo="${np.side + 1}">${esc(nextName)} – starta</button>`
+      : `<b>Skivan är slut.</b>${nxt && nxt !== r ? `<button data-nnext="1">💿 Lägg på ${esc(nxt.title)}</button>` : ''}`}</div>`);
+    return;
+  }
+  if (known && total) {
+    setH(bar, `<div class="np-bar"><i style="width:${Math.min(100, 100 * el / total).toFixed(1)}%"></i></div>`);
+    setH(clock, `${fmtClock(el)} av ${fmtClock(total)} · vänd om ${fmtClock(total - el)}`);
+    setH(act, '');
+  } else {
+    setH(bar, '');
+    setH(clock, `${fmtClock(el)} – speltid saknas för någon låt, så appen kan inte säga till när det är dags att vända.`);
+    setH(act, more ? `<button data-sgo="${np.side + 1}" style="margin-top:8px">Vänd till ${esc(lowName(nextName))}</button>` : '');
+  }
+}
+$('#npView').addEventListener('click', e => {
+  const r = np.r; if (!r) return;
+  if (e.target.closest('#npClose')) { closeNp(); return; }
+  if (e.target.closest('#npNext,[data-nnext]')) { const n = tonightNext(); if (n) openNowPlaying(n); return; }
+  if (e.target.closest('#npGo')) { np.start = Date.now(); np.flipped = false; drawNp(); return; }
+  const sg = e.target.closest('[data-sgo]');
+  if (sg) { np.side = +sg.dataset.sgo; np.start = Date.now(); np.flipped = false; drawNp(); $('#npView').scrollTop = 0; return; }
+  const sd = e.target.closest('[data-side]');
+  if (sd) { np.side = +sd.dataset.side; np.start = 0; np.flipped = false; drawNp(); return; }
+  const tr = e.target.closest('#npTr .tr[data-ti]');
+  if (tr) {
+    // Klockan till början av låten man trycker på.
+    const s = npSides(r)[np.side], i = +tr.dataset.ti;
+    const before = s.tracks.slice(0, i).reduce((a, t) => a + durSec(t.d), 0);
+    np.start = Date.now() - before * 1000; np.flipped = false;
+    drawNp();
+  }
+});
+
+/* ---------------- Hitta pressningen via dödvaxet ----------------
+   Texten som är inristad i dödvaxet (matris/runout) skiljer pressningar åt. Jämför den med Discogs uppgifter
+   ("Matrix / Runout") för de troligaste utgåvorna av albumet, en i taget (Discogs kvot: 60 anrop i minuten). */
+const roCache = new Map();   // utgåvans id → matrisrader
+const roNorm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+// Längsta gemensamma delsträng (antal tecken).
+function lcsub(a, b) {
+  let best = 0; const row = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = 0;
+    for (let j = 1; j <= b.length; j++) {
+      const up = row[j];
+      row[j] = a[i - 1] === b[j - 1] ? diag + 1 : 0;
+      if (row[j] > best) best = row[j];
+      diag = up;
+    }
+  }
+  return best;
+}
+// Hur väl det man skrivit stämmer med utgåvans matrisrader, 0–1. Flera sidor kan skiljas med / eller ;.
+function roScore(parts, vals) {
+  const nv = vals.map(roNorm).filter(Boolean);
+  if (!nv.length) return 0;
+  const per = parts.map(p => Math.max(...nv.map(v => lcsub(p, v) / p.length)));
+  return per.reduce((a, x) => a + x, 0) / per.length;
+}
+// Ordning att kolla utgåvorna i: vinyl först, samma land och katalognummer som skivan, katalognumret i texten.
+function roRank(r, vs, q) {
+  const nq = roNorm(q), rc = roNorm(r.catno);
+  const score = x => {
+    const cat = roNorm(x.catno);
+    return (/vinyl|\bLP\b|12"|10"|7"/i.test([x.format, ...(x.major_formats || [])].join(' ')) ? 4 : 0)
+      + (cat.length >= 3 && (nq.includes(cat) || cat.includes(nq)) ? 8 : 0)
+      + (rc && cat === rc ? 3 : 0) + (r.country && x.country === r.country ? 2 : 0);
+  };
+  return vs.map((x, i) => ({ x, i, s: score(x) })).sort((a, b) => b.s - a.s || a.i - b.i);
+}
+let roSeq = 0;
+async function roSearch(r, vs, box, extra = 0) {
+  const inp = box.querySelector('.roIn'), res = box.querySelector('.roRes');
+  const q = inp.value.trim();
+  const parts = q.split(/[\/;\n]+/).map(roNorm).filter(p => p.length >= 3);
+  if (!parts.length) { res.innerHTML = '<p class="note">Skriv minst tre tecken av texten i dödvaxet.</p>'; inp.focus(); return; }
+  const my = box.dataset.ro = String(++roSeq);
+  const order = roRank(r, vs, q), lim = Math.min(order.length, 20 + extra);
+  const hits = [];
+  fgBusy++;
+  try {
+    for (let n = 0; n < lim; n++) {
+      if (box.dataset.ro !== my || !box.isConnected) return;
+      res.innerHTML = `<p class="note"><span class="spin"></span>Jämför med utgåva ${n + 1} av ${lim}…</p>`;
+      const { x, i } = order[n];
+      let vals = roCache.get(x.id);
+      if (!vals) {
+        const j = await dg(`/releases/${x.id}`);
+        vals = (j.identifiers || []).filter(d => /matrix|runout/i.test(d.type || '')).map(d => d.value || '').filter(Boolean);
+        roCache.set(x.id, vals);
+      }
+      const s = roScore(parts, vals);
+      if (s >= 0.6) hits.push({ x, i, s, vals });
+      if (s >= 0.95 && parts.every(p => p.length >= 5)) break;   // säker träff: sluta leta
+    }
+  } catch (e) {
+    if (box.dataset.ro === my) res.innerHTML = `<p class="note">${esc(e.message)}</p>`;
+    return;
+  } finally { fgDone(); }
+  if (box.dataset.ro !== my || !box.isConnected) return;
+  hits.sort((a, b) => b.s - a.s);
+  const left = order.length - lim;
+  res.innerHTML = (hits.length
+    ? `<p class="note">${hits[0].s >= 0.95 ? 'Det här är troligen din pressning:' : 'De här stämmer bäst:'}</p>` + hits.slice(0, 5).map(h => `
+      <div class="cand" data-i="${h.i}" style="cursor:pointer">
+        ${h.x.thumb ? `<img src="${esc(h.x.thumb)}" alt="">` : '<div class="ph">♪</div>'}
+        <div><div class="t">${esc([h.x.format, h.x.country, h.x.released].filter(Boolean).join(' · '))}</div>
+          <div class="m">${esc([h.x.label, h.x.catno].filter(Boolean).join(' · '))}</div>
+          <div class="m" style="color:var(--acc)">${Math.round(h.s * 100)} % lika · ${esc(h.vals.slice(0, 2).join(' / '))}</div></div></div>`).join('')
+    : `<p class="note">Ingen av de ${lim} utgåvor jag kollade har den texten hos Discogs. Kolla stavningen (O och 0, I och 1 är lätta att blanda ihop), eller välj i listan nedan.</p>`)
+    + (left > 0 ? `<button class="roMore" data-n="${extra + 20}" style="margin-top:6px">Kolla ${Math.min(20, left)} utgåvor till</button>` : '');
+}
+
 /* ---------------- Statistik ---------------- */
 const statsOpen = () => $('#statsSheet').classList.contains('open');
 const closeStats = () => $('#statsSheet').classList.remove('open');
@@ -2887,7 +3255,11 @@ async function tidyFix(r, k) {
     delete r.infoErr;
     crateForget(r.id); gridSig = '';
   } else if (k === 'spotify') {
-    if ((await matchSpotify(r)) === 'net') throw new Error('Ingen kontakt med Spotify. Kolla nätet.');
+    if (!sp) throw new Error('Logga in på Spotify under ⚙︎ först.');
+    const res = await matchSpotify(r);
+    if (res === 'net') throw new Error('Ingen kontakt med Spotify. Kolla nätet.');
+    // För många anrop eller serverfel: stanna i stället för att dölja skivan som "inget album".
+    if (res === 'err' || !sp) throw new Error('Spotify svarar inte just nu. Försök igen om en stund.');
   } else if (k === 'price') {
     delete r.priceErr; delete r.priceWait;
     if (!(await priceNow(r))) throw new Error(r.priceErrMsg || 'Kunde inte hämta priset.');
@@ -2907,22 +3279,44 @@ function tidyRow(r, t) {
       <button data-tskip="${t.k}" data-tid="${esc(r.id)}" title="Dölj från listan">Dölj</button></div>
   </div>${t.k === 'release' ? `<div class="tvers" id="tv-${esc(r.id)}"></div>` : ''}`;
 }
-function openTidy() {
-  const panel = $('#statsSheet .panel'), keep = tidyOpen() ? panel.scrollTop : 0;
-  const groups = TIDY.map(t => ({ t, list: sortRecs(recs.filter(r => tidyMissing(r, t))) }));
+function tidyStats() {
+  const groups = TIDY.map(t => ({ t, list: recs.filter(r => tidyMissing(r, t)) }));
   const bad = new Set(groups.flatMap(g => g.list.map(r => r.id)));
   const pct = recs.length ? Math.floor(100 * (recs.length - bad.size) / recs.length) : 100;
+  return { groups, bad, pct };
+}
+// Tar bort en rättad rad och uppdaterar räknarna, utan att rita om listan (då flyttar sig inte raderna under
+// fingret, och en öppen utgåvelista ligger kvar).
+function tidyDrop(r, k) {
+  if (!tidyOpen()) return;
+  if (!TIDY.find(x => x.k === k).test(r) || (r.tidySkip || []).includes(k)) {
+    const row = $(`.rlist[data-tg="${k}"] [data-tr="${CSS.escape(r.id)}"]`);
+    if (row) { if (row.nextElementSibling?.classList.contains('tvers')) row.nextElementSibling.remove(); row.remove(); }
+  }
+  const { groups, bad, pct } = tidyStats();
+  for (const g of groups) { const el = $(`[data-tc="${g.t.k}"]`); if (el) el.textContent = g.list.length; }
+  if ($('#tidyPct')) $('#tidyPct').textContent = pct + ' %';
+  if ($('#tidyCnt')) $('#tidyCnt').textContent = `${recs.length - bad.size} av ${recs.length}`;
+}
+// Ritar om hela listan, men inte medan en utgåvelista är öppen (då skulle den tömmas mitt i valet).
+function tidyRedraw() {
+  if (tidyOpen() && !$('#tidyView .tvers:not(:empty)')) openTidy();
+}
+function openTidy() {
+  const panel = $('#statsSheet .panel'), keep = tidyOpen() ? panel.scrollTop : 0;
+  const st = tidyStats(), bad = st.bad, pct = st.pct;
+  const groups = st.groups.map(g => ({ t: g.t, list: sortRecs(g.list) }));
   const skipped = recs.filter(r => r.tidySkip?.length).length;
   $('#statsBody').innerHTML = `<div id="tidyView">
     <div class="row"><button id="tidyBack">‹ Statistik</button><h2 style="flex:1;text-align:center">Städa samlingen</h2><button id="closeStats">Stäng</button></div>
-    <div class="kpi" style="margin-top:10px"><span>Kompletta skivor</span><b>${pct} %</b>
-      <span>${recs.length - bad.size} av ${recs.length} har allt${skipped ? ` · ${skipped} med dolda rader (<a href="#" id="tidyUnskip">visa igen</a>)` : ''}</span></div>
+    <div class="kpi" style="margin-top:10px"><span>Kompletta skivor</span><b id="tidyPct">${pct} %</b>
+      <span><span id="tidyCnt">${recs.length - bad.size} av ${recs.length}</span> har allt${skipped ? ` · ${skipped} med dolda rader (<a href="#" id="tidyUnskip">visa igen</a>)` : ''}</span></div>
     ${!sp ? '<p class="note">Logga in på Spotify under ⚙︎ så visas även skivor utan Spotify-album.</p>' : ''}
     ${groups.filter(g => g.list.length).map(({ t, list }) => `
-      <div class="row" style="margin-top:20px;align-items:center"><h3 style="flex:1;margin:0">${t.h} (${list.length})</h3>
+      <div class="row" style="margin-top:20px;align-items:center"><h3 style="flex:1;margin:0">${t.h} (<span data-tc="${t.k}">${list.length}</span>)</h3>
         ${t.all && list.length > 1 ? `<button data-tall="${t.k}">${tidy.busy === t.k ? '<span class="spin"></span>Stoppa' : 'Hämta alla'}</button>` : ''}</div>
       ${t.note ? `<p class="note">${t.note}</p>` : ''}
-      <div class="rlist">${list.slice(0, 60).map(r => tidyRow(r, t)).join('')}</div>
+      <div class="rlist" data-tg="${t.k}">${list.slice(0, 60).map(r => tidyRow(r, t)).join('')}</div>
       ${list.length > 60 ? `<p class="note">… och ${list.length - 60} till. De visas när de första är klara.</p>` : ''}`).join('')
     || '<p class="msg">Allt är komplett. Snyggt!</p>'}
   </div>`;
@@ -2941,13 +3335,15 @@ async function tidyAll(k) {
       if (!r || my !== tidy.run || !statsOpen()) break;
       try { (await tidyFix(r, k)) ? fixed++ : failed++; }
       catch (e) { toast(e.message, 4000); break; }
-      if (tidyOpen()) openTidy();
+      tidyDrop(r, k);
+      // Spotify har ingen egen kvotkö som Discogs (dgSlot): vänta lite mellan skivorna, som matchAll gör.
+      if (k === 'spotify') await sleepMs(400);
     }
   } finally {
     fgDone();
     if (my === tidy.run) tidy.busy = '';
     render();
-    if (tidyOpen()) openTidy();
+    tidyRedraw();
     if (fixed || failed) toast(`${fixed} rättade${failed ? `, ${failed} gick inte (dolda)` : ''}`, 3000);
   }
 }
@@ -2965,7 +3361,7 @@ async function tidyAct(b) {
   if (b.dataset.tall) { tidyAll(b.dataset.tall); openTidy(); return true; }
   const r = recs.find(x => x.id === b.dataset.tid); if (!r) return true;
   if (b.dataset.tskip) {
-    r.tidySkip = [...new Set([...(r.tidySkip || []), b.dataset.tskip])]; saveRecs(); openTidy(); return true;
+    r.tidySkip = [...new Set([...(r.tidySkip || []), b.dataset.tskip])]; saveRecs(); tidyDrop(r, b.dataset.tskip); return true;
   }
   const k = b.dataset.tfix;
   if (k === 'release') {
@@ -2980,8 +3376,10 @@ async function tidyAct(b) {
     if (!ok) toast(k === 'spotify' ? 'Hittade inget album i Spotify. Öppna skivan och välj själv.'
       : 'Discogs har inte den uppgiften. Raden är dold.', 4000);
     render();
+    tidyDrop(r, k);
   } catch (err) { toast(err.message, 4000); }
-  if (tidyOpen()) openTidy();
+  if (tidyOpen() && !b.isConnected) return true;
+  if (b.isConnected) { b.disabled = false; b.textContent = TIDY.find(x => x.k === k).btn; }
   return true;
 }
 
@@ -3115,6 +3513,7 @@ $('#statsSheet').addEventListener('change', e => {
 /* ---------------- Genvägar på appikonen ----------------
    Långtryck på appikonen (Android-skal v8) öppnar appen med ett av de här valen. */
 window.__go = what => {
+  if (npOpen()) closeNp();
   closeStats(); if ($('#detail').classList.contains('open')) closeDetail();
   if (shopOpen()) closeShop();
   if (what === 'shop') openShop();
@@ -3339,6 +3738,7 @@ window.__checkPending = checkPending;
 
 /* ---------------- Bakåtknapp i appen ---------------- */
 window.__back = () => {
+  if (npOpen()) { closeNp(); return true; }
   if ($('#logSheet').classList.contains('open')) { closeLog(); return true; }
   if (shopOpen()) { closeShop(); return true; }
   if (statsOpen()) { closeStats(); return true; }

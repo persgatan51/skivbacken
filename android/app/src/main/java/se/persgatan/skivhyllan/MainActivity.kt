@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.JavascriptInterface
 import android.webkit.RenderProcessGoneDetail
 import android.widget.Toast
@@ -56,7 +57,8 @@ import java.util.concurrent.Executors
  *    utan att man behöver trycka mellan fotona),
  *  - att appen laddar om sidan i stället för att stängas om WebViews ritprocess kraschar,
  *  - App.print(): skriver ut en HTML-sida med telefonens utskriftstjänst eller som PDF (v8),
- *  - genvägar på appikonen (res/xml/shortcuts.xml), som öppnar t.ex. butiksläget direkt (v8).
+ *  - genvägar på appikonen (res/xml/shortcuts.xml), som öppnar t.ex. butiksläget direkt (v8),
+ *  - App.keepAwake(): håller skärmen tänd medan "Nu spelas" visas (v9).
  *
  * Bryggan App.* svarar bara när sidan som visas är webbappen (inte t.ex. Spotifys inloggningssidor).
  */
@@ -102,7 +104,11 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        pendingGo = goOf(intent)
+        // Genvägen gäller bara när man just tryckt på den. Återställer Android appen (t.ex. efter att processen
+        // stängts medan kameran var öppen) eller öppnas den från "senaste appar" får samma intent inte köras igen:
+        // då skulle kameran öppnas på nytt ovanpå fotot som återställs.
+        val fromHistory = ((intent?.flags ?: 0) and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0
+        pendingGo = if (savedInstanceState == null && !fromHistory) goOf(intent) else null
         createWeb()
         // Fotot som kameran skulle spara, om appen stängts av Android medan kameran var öppen.
         savedInstanceState?.getString("photoUri")?.let { photoUri = Uri.parse(it) }
@@ -127,7 +133,10 @@ class MainActivity : Activity() {
         val go = pendingGo ?: return
         if (pageHost != HOST) return
         web.evaluateJavascript("window.__go ? (window.__go('$go'), 'ok') : 'no'") { r ->
-            if (r?.contains("ok") == true && pendingGo == go) pendingGo = null
+            if (r?.contains("ok") == true && pendingGo == go) {
+                pendingGo = null
+                intent?.let { if (goOf(it) != null) setIntent(Intent(it).setData(null)) }   // levererad: glöm den
+            }
         }
     }
 
@@ -173,6 +182,7 @@ class MainActivity : Activity() {
         // Samma sak för backupen: sidan som väntade på svaret finns inte längre (ritprocessen kraschade medan
         // filväljaren var öppen). Utan id går resultatet via setPending, som den nya sidan hämtar vid start.
         pendingSaveId = null; pendingSaveJson = null; pendingOpenId = null; pendingPhotoId = null
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)   // "Nu spelas" får slå på den igen
         web = WebView(this)
         setContentView(web)
         web.settings.javaScriptEnabled = true
@@ -514,7 +524,7 @@ class MainActivity : Activity() {
         // Bara webbappen får använda bryggan, inte andra sidor som visas i appen (t.ex. Spotifys inloggning).
         private fun trusted() = pageHost == HOST
 
-        @JavascriptInterface fun version(): String = if (trusted()) "8" else "0"
+        @JavascriptInterface fun version(): String = if (trusted()) "9" else "0"
 
         /** mode: "auto" = bara om en fil redan är vald, "save" = samma fil som förut (annars välj), "pick" = välj ny plats. */
         @JavascriptInterface fun saveBackup(json: String, id: String, mode: String) {
@@ -588,6 +598,14 @@ class MainActivity : Activity() {
         /** Skriver ut en HTML-sida (t.ex. etiketter till hyllans avdelare) med telefonens utskriftstjänst (v8). */
         @JavascriptInterface fun print(html: String, title: String) {
             if (trusted()) runOnUiThread { printHtml(html, title.take(60)) }
+        }
+        /** Håller skärmen tänd medan "Nu spelas" visas (v9). */
+        @JavascriptInterface fun keepAwake(on: Boolean) {
+            if (!trusted()) return
+            runOnUiThread {
+                if (on) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
         }
         /** Öppnar telefonens dela-meny med en text (v5). */
         @JavascriptInterface fun share(text: String, title: String) {

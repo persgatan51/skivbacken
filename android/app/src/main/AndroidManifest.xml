@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- "Nu spelas" vibrerar när det är dags att vända skivan. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:label="Skivbacken"
