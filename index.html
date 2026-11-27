@@ -72,6 +72,19 @@
          background:#2a2f3a;color:var(--fg);padding:10px 16px;border-radius:12px;opacity:0;transition:.25s;z-index:50;
          max-width:90vw;text-align:center;pointer-events:none}
   #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  #toast.act.show{pointer-events:auto;cursor:pointer;border:1px solid var(--acc)}
+  .bkwarn{color:#ff8a7a}
+  .rlist.sim .x button{padding:5px 10px;font-size:13px;white-space:nowrap}
+  .np-sim{text-align:left;margin-top:8px}
+  .rlist.inv .ri.seen{opacity:.45}
+  .rlist.inv .x button{padding:5px 10px;font-size:13px;white-space:nowrap}
+  .quiz-img{width:min(78vw,320px);aspect-ratio:1;margin:14px auto 4px;border-radius:8px;overflow:hidden;background:var(--card)}
+  .quiz-img img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .4s,filter .4s}
+  .quiz-img.hard img{transform:scale(3.2);filter:blur(5px)}
+  .quiz-opts{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .quiz-opts button{border-radius:12px;padding:12px 8px;min-height:52px;line-height:1.2}
+  .quiz-opts button.right{background:var(--sp);border-color:var(--sp);color:#111;font-weight:600;opacity:1}
+  .quiz-opts button.wrong{background:#7a2a2a;border-color:#b54a4a;opacity:1}
   .read{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;margin:8px 0;font-size:14px}
   .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--mut);border-top-color:transparent;border-radius:50%;animation:s 1s linear infinite;vertical-align:-2px;margin-right:6px}
   @keyframes s{to{transform:rotate(360deg)}}
@@ -382,8 +395,11 @@ const saveRecs = (o = {}) => {
 const saveCfg = () => LS.set('sh.cfg', cfg);
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
-function toast(t, ms = 2600) {
+// onClick: gör toasten tryckbar (t.ex. "tryck för att välja fil igen").
+function toast(t, ms = 2600, onClick = null) {
   const el = $('#toast'); el.textContent = t; el.classList.add('show');
+  el.classList.toggle('act', !!onClick);
+  el.onclick = onClick ? () => { el.classList.remove('show'); onClick(); } : null;
   clearTimeout(toast.t); toast.t = setTimeout(() => el.classList.remove('show'), ms);
 }
 function openUrl(url) {
@@ -1700,6 +1716,7 @@ function drawDetail() {
       <div class="valbox" id="dVal"></div>
       <p class="note" id="dSp">${r.spotifyName ? 'Spotify: ' + esc(r.spotifyName) : sp ? '' : 'Spela öppnar en sökning i Spotify. Logga in på Spotify under ⚙︎ för att hamna direkt på albumet.'}</p>
       <div class="tracks" id="dTracks"><div class="msg"><span class="spin"></span>Hämtar låtlistan…</div></div>
+      ${similarHtml(r)}
       <div class="actions">
         ${sp ? '<button id="dFix">Fel album i Spotify? Välj ett annat</button><div id="dAlts"></div>' : ''}
         ${r.dId ? `<button id="dDiscogs">Visa på Discogs</button>` : ''}
@@ -1824,15 +1841,25 @@ async function spTokenCall(body) {
   sp = { access: j.access_token, refresh: j.refresh_token || sp?.refresh, exp: Date.now() + j.expires_in * 1000 };
   LS.set('sh.sp', sp);
 }
+// Bara en förnyelse åt gången: Spotify byter refresh token när den används, så två samtidiga förnyelser
+// (t.ex. bakgrundsjobbet och ett tryck på Spela) gjorde att den andra underkändes – och då loggades man ut.
+let spRefreshing = null;
 async function spAccess() {
   if (!sp) return null;
   if (Date.now() < sp.exp - 60000) return sp.access;
-  try { await spTokenCall({ grant_type: 'refresh_token', refresh_token: sp.refresh }); return sp.access; }
-  catch (e) {
-    // Logga bara ut om Spotify säger att inloggningen inte gäller längre – inte vid nätfel.
-    if (e.code === 'invalid_grant' || e.status === 400 || e.status === 401) { sp = null; LS.set('sh.sp', null); }
-    return null;
+  if (!spRefreshing) {
+    const used = sp.refresh;
+    spRefreshing = spTokenCall({ grant_type: 'refresh_token', refresh_token: used })
+      .catch(e => {
+        // Logga bara ut om Spotify säger att inloggningen inte gäller längre – inte vid nätfel – och bara om det
+        // är den refresh token som fortfarande är sparad (inte en gammal som redan bytts ut).
+        if ((e.code === 'invalid_grant' || e.status === 400 || e.status === 401) && sp?.refresh === used) { sp = null; LS.set('sh.sp', null); }
+        throw e;
+      })
+      .finally(() => { spRefreshing = null; });
   }
+  try { await spRefreshing; return sp?.access ?? null; }
+  catch { return null; }
 }
 // fg: användaren väntar (t.ex. tryckt på en låt) – vänta inte på Spotify vid 429 utan ge upp direkt.
 // Returnerar null bara om man inte är inloggad. Går det inte att nå Spotify (inget nät, token gick inte
@@ -1978,8 +2005,15 @@ $('#btnImport').onclick = () => {
 };
 
 /* ---------------- Ändringslogg (nyast överst) ---------------- */
-const WEB_VERSION = '2026-11-25';
+const WEB_VERSION = '2026-11-27';
 const CHANGELOG = [
+  { d: '2026-11-27', t: 'Liknande skivor, inventering, skivquiz och säkrare backup', i: [
+    'Ny: "Liknande i din samling" i skivans detaljvy och i Nu spelas: skivor ur din egen hylla med samma stil, skivbolag eller närliggande år. De du inte spelat på länge kommer först, och + 🌙 lägger dem i kvällens kö.',
+    'Ny: "Inventering" under 📊. Bocka av skivorna du ser på hyllan (eller skanna streckkoden), ett fack i taget om du vill. Efteråt ser du vilka som inte hittades – kanske utlånade utan att det markerats.',
+    'Ny: "Skivquiz" under 📊. Gissa artist, skiva eller år utifrån omslagen i samlingen, med fyra svar att välja på. "Svår" visar bara en suddig bit av omslaget. Rätt svar? Lägg på skivan direkt.',
+    'Rättat: Spotify kunde logga ut dig av sig själv när två saker förnyade inloggningen samtidigt.',
+    'Rättat: appen varnar nu om den automatiska backupen inte fungerar (t.ex. om filen på Drive raderats) eller om senaste backup är mer än en vecka gammal. Tryck på varningen för att välja fil igen. Nya appen säger dessutom direkt när en backup misslyckas.',
+    'Rättat: "Nu spelas" och klockan för att vända kommer tillbaka om appen laddas om. Nya appen laddar inte heller om när telefonen byter till mörkt läge eller delad skärm.' ] },
   { d: '2026-11-25', t: 'Kvällens skivor, Nu spelas och hitta din pressning', i: [
     'Ny: "Kvällens kö" i skivans detaljvy. Plocka fram skivorna du vill spela ikväll; de visas överst med total speltid, och spelade skivor bockas av. Kön töms av sig själv efter ett dygn.',
     'Ny: "Nu spelas" visar omslaget stort med låtlistan för sidan du spelar. Tryck när nålen går ner, så markeras låten som spelas och appen säger till (och vibrerar) när det är dags att vända. Skärmen hålls tänd (kräver nya appen från GitHub, Android-skal v9).',
@@ -2258,19 +2292,47 @@ function bkInfo() {
   const name = (nativeVer() >= 3 ? App.backupName() : '') || b?.name || '';
   $('#bkInfo').innerHTML = nativeVer() < 3
     ? 'Finns i Android-appen. Installera senaste versionen från GitHub (Releases).'
-    : (b ? `Senaste backup: ${esc(new Date(b.at).toLocaleString('sv-SE', { dateStyle: 'short', timeStyle: 'short' }))}${name ? ' i ' + esc(name) : ''}.` : 'Ingen backup sparad än.')
+    : (bkProblem() ? `<b class="bkwarn">⚠️ ${esc(bkProblem())} Tryck "Välj ny plats" nedan.</b><br>` : '')
+      + (b ? `Senaste backup: ${esc(new Date(b.at).toLocaleString('sv-SE', { dateStyle: 'short', timeStyle: 'short' }))}${name ? ' i ' + esc(name) : ''}.` : 'Ingen backup sparad än.')
       + ' Välj Google Drive i filväljaren första gången. Filen innehåller skivorna och inställningarna, även dina nycklar.';
   $('#bkAuto').checked = !!cfg.bkAuto;
+}
+/* Varning när den automatiska backupen inte fungerar. Annars märks det först när telefonen behöver återställas.
+   - sh.bkErr: senaste automatiska backup misslyckades (filen raderad/flyttad, behörigheten borta …).
+   - Äldre app (före 2026-11-27) säger inte varför, så som extra skydd: automatisk backup är på, du har ändrat
+     något, men senaste lyckade backup är äldre än en vecka. */
+function bkProblem() {
+  if (!cfg.bkAuto || nativeVer() < 3) return '';
+  const err = LS.get('sh.bkErr', null), b = LS.get('sh.bk', null), edit = LS.get('sh.lastEdit', 0);
+  if (err) return 'Den automatiska backupen misslyckades ' + new Date(err.at).toLocaleDateString('sv-SE') + '.';
+  if (!b) return edit ? 'Den automatiska backupen har inte sparats någon gång.' : '';
+  if (Date.now() - b.at > 7 * DAY && edit > b.at) return `Senaste lyckade backup är ${Math.floor((Date.now() - b.at) / DAY)} dagar gammal.`;
+  return '';
+}
+function bkWarn(force = false) {
+  const p = bkProblem(); if (!p) return;
+  // Högst en gång per dygn, så att den inte tjatar vid varje ändring.
+  if (!force && Date.now() - LS.get('sh.bkWarnAt', 0) < DAY) return;
+  LS.set('sh.bkWarnAt', Date.now());
+  toast(`⚠️ ${p} Tryck här för att välja backupfil igen.`, 9000, () => driveSave('pick'));
 }
 async function driveSave(mode = 'save') {
   if (nativeVer() < 3) { if (mode !== 'auto') toast('Installera senaste appversionen för att spara till Drive.'); return; }
   try {
     const name = await native(id => App.saveBackup(backupJson(), id, mode));
     LS.set('sh.bk', { at: Date.now(), name });
+    LS.set('sh.bkErr', null);
     if (mode !== 'auto') toast(`Backup sparad i ${name}`);
     if ($('#settings').classList.contains('open')) bkInfo();
   } catch (e) {
     if (mode !== 'auto' && e.message !== 'cancel') toast(e.message, 4000);
+    // Automatisk backup som inte gick: "fail:…" = filen gick inte att skriva (ny app), "nouri" = ingen fil vald
+    // (eller, i äldre appar, att skrivningen misslyckades). Båda betyder att samlingen inte är säkrad.
+    if (mode === 'auto' && cfg.bkAuto && e.message !== 'cancel') {
+      if (!LS.get('sh.bkErr', null)) LS.set('sh.bkErr', { at: Date.now(), msg: e.message.replace(/^fail:/, '') });
+      bkWarn();
+      if ($('#settings').classList.contains('open')) bkInfo();
+    }
   }
 }
 async function driveLoad() {
@@ -2289,6 +2351,7 @@ let autoT = 0, autoFirst = 0;
 function autoBackup() {
   if (!cfg.bkAuto || nativeVer() < 3) return;
   const now = Date.now(); if (!autoFirst) autoFirst = now;
+  LS.set('sh.lastEdit', now);   // för varningen om backupen är gammal (bkProblem)
   clearTimeout(autoT);
   autoT = setTimeout(runAutoBackup, Math.max(0, Math.min(15000, autoFirst + 60000 - now)));
 }
@@ -2930,6 +2993,52 @@ function crateJump(id) {
   return true;
 }
 
+/* ---------------- Liknande i din samling ----------------
+   Skivor ur din egen hylla som liknar den här: samma stil (starkast), skivbolag, genre, närliggande år eller
+   samma artist. De som inte spelats på länge kommer först vid lika poäng. Allt räknas lokalt – inga anrop. */
+function similarRecs(r, n = 6) {
+  const styles = new Set(r.style || []), genres = new Set(r.genre || []), label = labelOf(r);
+  const out = [];
+  for (const x of recs) {
+    if (x === r || x.status !== 'have' || sameRec(x, r)) continue;
+    let s = 0;
+    for (const st of x.style || []) if (styles.has(st)) s += 3;
+    for (const g of x.genre || []) if (genres.has(g)) s += 1;
+    if (label && labelOf(x) === label && !/^not on label/i.test(label)) s += 2;
+    if (r.year && x.year) { const d = Math.abs(r.year - x.year); s += d <= 2 ? 1.5 : d <= 5 ? 0.5 : 0; }
+    if (x.artist === r.artist && !/^various/i.test(r.artist)) s += 1.5;
+    if (s >= 3) out.push([x, s]);
+  }
+  return out.sort((a, b) => b[1] - a[1] || (a[0].lastPlayed || 0) - (b[0].lastPlayed || 0)).slice(0, n).map(x => x[0]);
+}
+function similarHtml(r) {
+  const list = r.status === 'have' ? similarRecs(r) : [];
+  if (!list.length) return '';
+  return `<h3 style="margin-top:22px">Liknande i din samling</h3>
+    <div class="rlist sim">${list.map(x => `
+      <div class="ri" data-simid="${esc(x.id)}">
+        ${x.thumb || x.cover ? `<img src="${esc(x.thumb || x.cover)}" alt="" loading="lazy">` : '<div class="ph">♪</div>'}
+        <div style="min-width:0"><div class="t" style="margin:0">${esc(x.title)}</div>
+          <div class="m">${esc(x.artist)}${x.year ? ' · ' + esc(x.year) : ''}${x.lastPlayed ? '' : ' · aldrig spelad'}</div></div>
+        <div class="x"><button data-simtn="${esc(x.id)}" class="${inTonight(x.id) ? 'on' : ''}" aria-label="Kvällens kö">${inTonight(x.id) ? '✓ 🌙' : '+ 🌙'}</button></div>
+      </div>`).join('')}</div>
+    <p class="note">Tryck + 🌙 för att lägga skivan i kvällens kö.</p>`;
+}
+// Klick i listan (i detaljvyn och i Nu spelas). Ger true om klicket hörde hit.
+function similarClick(e) {
+  const tn = e.target.closest('[data-simtn]');
+  if (tn) {
+    const x = recs.find(y => y.id === tn.dataset.simtn); if (!x) return true;
+    toggleTonight(x);
+    tn.classList.toggle('on', inTonight(x.id)); tn.textContent = inTonight(x.id) ? '✓ 🌙' : '+ 🌙';
+    return true;
+  }
+  const row = e.target.closest('[data-simid]');
+  if (row) { if (npOpen()) closeNp(); openDetail(row.dataset.simid); $('#detail .panel').scrollTop = 0; return true; }
+  return false;
+}
+$('#detail').addEventListener('click', e => { if (similarClick(e)) e.stopPropagation(); });
+
 /* ---------------- Kvällens skivor ----------------
    En liten lyssningskö: skivor man plockat fram inför kvällen, med total speltid. Ligger bara i telefonen
    (inte i backupen) och töms av sig själv när den inte rörts på ett dygn. */
@@ -3016,9 +3125,22 @@ async function npAwake(on) {
 }
 // Webbläsarens wake lock släpps när man lämnar sidan; ta den igen när man kommer tillbaka.
 document.addEventListener('visibilitychange', () => { if (npOpen() && document.visibilityState === 'visible' && nativeVer() < 9) npAwake(true); });
-function openNowPlaying(r) {
-  np.r = r; np.side = 0; np.start = 0; np.flipped = false;
-  markPlayed(r);
+// Sparar var man är i "Nu spelas", så att vyn (och klockan för att vända) kommer tillbaka om sidan laddas om –
+// t.ex. när Android stänger appen i bakgrunden eller telefonen byter till mörkt läge.
+function npSave() { LS.set('sh.np', np.r ? { id: np.r.id, side: np.side, start: np.start, flipped: np.flipped } : null); }
+function npResume() {
+  const s = LS.get('sh.np', null); if (!s?.start) return;
+  const r = recs.find(x => x.id === s.id); if (!r) { LS.set('sh.np', null); return; }
+  const side = npSides(r)[s.side];
+  const total = side ? side.tracks.reduce((a, t) => a + durSec(t.d), 0) : 0;
+  // Bara om sidan inte tog slut för länge sedan (10 min marginal; utan speltid högst 40 min).
+  if (Date.now() - s.start > ((total || 1800) + 600) * 1000) { LS.set('sh.np', null); return; }
+  openNowPlaying(r, s);
+}
+function openNowPlaying(r, resume = null) {
+  np.r = r; np.side = resume?.side || 0; np.start = resume?.start || 0; np.flipped = !!resume?.flipped;
+  if (!resume) markPlayed(r);
+  npSave();
   if ($('#detail').classList.contains('open')) closeDetail();
   $('#npView').classList.add('open');
   $('#npView').scrollTop = 0;
@@ -3033,10 +3155,11 @@ function openNowPlaying(r) {
 function closeNp() {
   clearInterval(np.timer); np.timer = 0;
   $('#npView').classList.remove('open'); $('#npView').innerHTML = '';
-  np.r = null; npAwake(false);
+  np.r = null; npAwake(false); npSave();
 }
 function drawNp() {
   const r = np.r; if (!r) return;
+  npSave();   // drawNp körs efter varje tryck (start, vänd, byt sida, hoppa till låt)
   const sides = npSides(r), s = sides[np.side];
   const nxt = tonightNext();
   $('#npView').innerHTML = `
@@ -3054,7 +3177,8 @@ function drawNp() {
     <div class="actions">
       ${s ? `<button id="npGo" class="play">${np.start ? '↺ Börja om ' + esc(lowName(s.name)) : '▶ Nålen är nere – starta ' + esc(lowName(s.name))}</button>` : ''}
       ${nxt && nxt !== r ? `<button id="npNext">💿 Nästa i kvällens kö: ${esc(nxt.title)}</button>` : ''}
-    </div>`;
+    </div>
+    <div class="np-sim">${similarHtml(r)}</div>`;
   npTick();
 }
 // Skriver bara om när innehållet ändrats, så att en knapp inte byts ut mitt i ett tryck (tick varje sekund).
@@ -3081,7 +3205,7 @@ function npTick() {
   if (known && total && el >= total) {
     const nxt = tonightNext();
     if (!np.flipped) {
-      np.flipped = true;
+      np.flipped = true; npSave();
       try { navigator.vibrate?.([300, 150, 300]); } catch {}
       toast(more ? `Dags att vända – ${lowName(nextName)}` : 'Skivan är slut', 5000);
     }
@@ -3102,6 +3226,7 @@ function npTick() {
 }
 $('#npView').addEventListener('click', e => {
   const r = np.r; if (!r) return;
+  if (similarClick(e)) { if (np.r) drawNp(); return; }   // "Nästa i kvällens kö" kan ha ändrats
   if (e.target.closest('#npClose')) { closeNp(); return; }
   if (e.target.closest('#npNext,[data-nnext]')) { const n = tonightNext(); if (n) openNowPlaying(n); return; }
   if (e.target.closest('#npGo')) { np.start = Date.now(); np.flipped = false; drawNp(); return; }
@@ -3204,9 +3329,11 @@ const statsOpen = () => $('#statsSheet').classList.contains('open');
 const closeStats = () => $('#statsSheet').classList.remove('open');
 $('#statsSheet').addEventListener('click', e => {
   if (e.target.id === 'statsSheet') { closeStats(); return; }
-  if (tidyClick(e) || divClick(e)) return;
+  if (tidyClick(e) || divClick(e) || invClick(e) || quizClick(e)) return;
   if (e.target.closest('#stTidy')) { openTidy(); return; }
   if (e.target.closest('#stDivide')) { openDivide(); return; }
+  if (e.target.closest('#stInv')) { openInv(); return; }
+  if (e.target.closest('#stQuiz')) { quiz.q = null; openQuiz(); return; }
   const ri = e.target.closest('[data-rid]');
   if (ri) { closeStats(); openDetail(ri.dataset.rid); return; }
   const m = e.target.closest('[data-missing]');
@@ -3222,6 +3349,193 @@ $('#worth').addEventListener('click', e => {
   e.preventDefault();
   if (a.dataset.act === 'deals') openStats('deals');
   else if (a.dataset.act === 'share') shareWants();
+});
+
+/* ---------------- Inventering av hyllan ----------------
+   Gå igenom hyllan och bocka av skivorna du ser (eller skanna streckkoden). Efteråt syns vilka som inte hittades:
+   kanske utlånade utan att det markerats, felplacerade eller sålda. Bara Har-skivor. Sparas i telefonen
+   (sh.inv) så att man kan ta ett fack i taget, över flera dagar. */
+let inv = LS.get('sh.inv', null);   // { at, seen: { id: tid } }
+const invOpen = () => !!$('#invView') && statsOpen();
+const invSave = () => LS.set('sh.inv', inv);
+const invState = { q: '', showSeen: false, scanning: false };
+function openInv() {
+  if (!inv) { inv = { at: Date.now(), seen: {} }; invSave(); }
+  const panel = $('#statsSheet .panel'), keep = invOpen() ? panel.scrollTop : 0;
+  const have = sortRecs(recs.filter(r => r.status === 'have'));
+  const seenN = have.filter(r => inv.seen[r.id]).length;
+  const q = norm(invState.q);
+  const shown = have.filter(r => (invState.showSeen || !inv.seen[r.id]) && (!q || norm(r.artist + ' ' + r.title).includes(q)));
+  const pct = have.length ? Math.round(100 * seenN / have.length) : 0;
+  $('#statsBody').innerHTML = `<div id="invView">
+    <div class="row"><button id="invBack">‹ Statistik</button><h2 style="flex:1;text-align:center">Inventering</h2><button id="closeStats">Stäng</button></div>
+    <div class="kpi" style="margin-top:10px"><span>Hittade på hyllan</span><b>${seenN} av ${have.length}</b>
+      <span>${pct} % · påbörjad ${esc(new Date(inv.at).toLocaleDateString('sv-SE'))}</span>
+      <div class="np-bar" style="margin-top:6px"><i style="width:${pct}%"></i></div></div>
+    <p class="note">Gå längs hyllan och bocka av varje skiva du ser${nativeVer() >= 3 ? ', eller skanna streckkoden' : ''}. Du kan ta ett fack i taget – det sparas tills du börjar om.</p>
+    <div class="actions">
+      ${nativeVer() >= 3 ? `<button class="play" id="invScan">${invState.scanning ? '<span class="spin"></span>Skannar…' : '📷 Skanna streckkoder'}</button>` : ''}
+      <div class="split"><button id="invSeen" class="${invState.showSeen ? 'on' : ''}">${invState.showSeen ? 'Visar alla' : 'Visa även hittade'}</button>
+        <button id="invReset">Börja om</button></div>
+    </div>
+    <input id="invQ" type="search" placeholder="Sök artist eller skiva" value="${esc(invState.q)}" style="width:100%;margin-top:12px">
+    <h3>${invState.showSeen ? 'Alla Har-skivor' : seenN === have.length ? 'Alla hittade! 🎉' : `Inte hittade än (${have.length - seenN})`}</h3>
+    <div class="rlist inv">${shown.slice(0, 150).map(r => `
+      <div class="ri${inv.seen[r.id] ? ' seen' : ''}" data-rid="${esc(r.id)}">
+        ${r.thumb || r.cover ? `<img src="${esc(r.thumb || r.cover)}" alt="" loading="lazy">` : '<div class="ph">♪</div>'}
+        <div style="min-width:0"><div class="t" style="margin:0">${esc(r.title)}</div>
+          <div class="m">${esc(r.artist)}${r.loan ? ' · utlånad till ' + esc(r.loan.to) : ''}</div></div>
+        <div class="x"><button data-invt="${esc(r.id)}" class="${inv.seen[r.id] ? 'on' : ''}">${inv.seen[r.id] ? '✓ Hittad' : 'Hittad'}</button></div>
+      </div>`).join('')}</div>
+    ${shown.length > 150 ? `<p class="note">… och ${shown.length - 150} till. Sök eller bocka av så visas fler.</p>` : ''}
+    ${!invState.showSeen && seenN && seenN < have.length ? '<p class="note">Saknas en skiva? Tryck på den för att markera den som utlånad eller ta bort den.</p>' : ''}
+  </div>`;
+  $('#statsSheet').classList.add('open');
+  panel.scrollTop = keep;
+}
+function invMark(r, on = true) {
+  if (on) inv.seen[r.id] = Date.now(); else delete inv.seen[r.id];
+  invSave();
+}
+// Skannar streckkod efter streckkod tills man avbryter. Den skannade utgåvan (eller samma album) bockas av.
+async function invScan() {
+  if (invState.scanning) return;
+  if (!cfg.discogs) { toast('Lägg in din Discogs-token under ⚙︎ först.'); return; }
+  invState.scanning = true; fgBusy++; openInv();
+  let n = 0;
+  try {
+    for (;;) {
+      let code;
+      try { code = await native(id => App.scanBarcode(id)); }
+      catch (e) { if (e.message !== 'cancel') toast('Skannern: ' + e.message.replace(/^fail:/, ''), 4000); break; }
+      code = String(code).replace(/\D/g, ''); if (!code) continue;
+      toast('Söker ' + code + '…', 8000);
+      const res = await searchBarcode(code, msg => toast(msg + ' – försöker igen…', 8000));
+      if (res.err) { toast(res.err.message, 4000); break; }
+      const have = recs.filter(r => r.status === 'have');
+      // Exakt utgåva först, annars samma album.
+      const r = res.cands.map(c => have.find(x => ownsRelease(x, c))).find(Boolean)
+        || res.cands.map(c => have.find(x => sameRec(x, c) || (c.masterId && x.masterId === c.masterId))).find(Boolean);
+      if (r) {
+        const again = !!inv.seen[r.id];
+        invMark(r); n++;
+        toast(again ? `Redan hittad: ${r.title}` : `✓ ${r.title} – ${r.artist}`, 2500);
+      } else toast(res.cands.length ? `Inte i din samling: ${res.cands[0].title}` : 'Streckkoden finns inte hos Discogs. Bocka av för hand.', 3500);
+      if (invOpen()) openInv();
+      await sleepMs(900);
+    }
+  } finally {
+    invState.scanning = false; fgDone();
+    if (invOpen()) openInv();
+    if (n) toast(`${n} skivor bockade av`, 2500);
+  }
+}
+function invClick(e) {
+  if (!$('#invView')) return false;
+  const t = e.target.closest('[data-invt]');
+  if (t) {
+    const r = recs.find(x => x.id === t.dataset.invt); if (!r) return true;
+    invMark(r, !inv.seen[r.id]); openInv(); return true;
+  }
+  const b = e.target.closest('#invBack,#invScan,#invSeen,#invReset');
+  if (!b) return false;
+  if (b.id === 'invBack') openStats();
+  else if (b.id === 'invScan') invScan();
+  else if (b.id === 'invSeen') { invState.showSeen = !invState.showSeen; openInv(); }
+  else if (b.id === 'invReset') {
+    if (!b.dataset.sure) { b.dataset.sure = 1; b.textContent = 'Tryck igen'; return true; }
+    inv = { at: Date.now(), seen: {} }; invSave(); invState.q = ''; openInv(); toast('Inventeringen börjar om');
+  }
+  return true;
+}
+let invQT = 0;
+$('#statsSheet').addEventListener('input', e => {
+  if (e.target.id !== 'invQ') return;
+  invState.q = e.target.value;
+  clearTimeout(invQT);
+  invQT = setTimeout(() => {
+    const pos = e.target.selectionStart; openInv();
+    const el = $('#invQ'); if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch {} }
+  }, 250);
+});
+
+/* ---------------- Skivquiz ----------------
+   Visa ett omslag ur samlingen och gissa artist, skiva eller år bland fyra svar (alla från samlingen).
+   "Svår" visar bara en suddig bit av omslaget. Filter på decennium och genre. Rätt svar → lägg på skivan. */
+const quiz = { what: 'artist', hard: false, dec: '', genre: '', q: null, picked: null, right: 0, total: 0, recent: [] };
+const QUIZ_WHAT = { artist: 'Vem är artisten?', title: 'Vad heter skivan?', year: 'Vilket år kom den?' };
+const quizVal = (r, what) => what === 'year' ? (r.year ? String(r.year) : '') : what === 'artist' ? (/^various/i.test(r.artist) ? '' : r.artist) : r.title;
+function quizPool() {
+  return recs.filter(r => r.status === 'have' && (r.thumb || r.cover)
+    && (!quiz.dec || decOf(r) === quiz.dec) && (!quiz.genre || (r.genre || []).includes(quiz.genre)));
+}
+function quizNext() {
+  const pool = quizPool().filter(r => quizVal(r, quiz.what));
+  const vals = [...new Set(pool.map(r => quizVal(r, quiz.what)))];
+  quiz.picked = null;
+  if (vals.length < 4) { quiz.q = null; return; }
+  // Inte samma skiva igen förrän några andra har varit med.
+  const fresh = pool.filter(r => !quiz.recent.includes(r.id));
+  const r = (fresh.length ? fresh : pool)[Math.floor(Math.random() * (fresh.length || pool.length))];
+  quiz.recent = [...quiz.recent, r.id].slice(-Math.min(20, Math.floor(pool.length / 2)));
+  const right = quizVal(r, quiz.what);
+  let wrong = vals.filter(v => v !== right);
+  // År: närliggande år är roligare (och svårare) än helt slumpade.
+  if (quiz.what === 'year') wrong.sort((a, b) => Math.abs(a - right) - Math.abs(b - right) || Math.random() - 0.5), wrong = wrong.slice(0, 8);
+  const opts = [right];
+  while (opts.length < 4 && wrong.length) opts.push(wrong.splice(Math.floor(Math.random() * wrong.length), 1)[0]);
+  opts.sort(() => Math.random() - 0.5);
+  if (quiz.what === 'year') opts.sort((a, b) => a - b);
+  // Suddig bit: förstoring och en slumpad del av omslaget.
+  quiz.q = { r, right, opts, ox: Math.round(Math.random() * 100), oy: Math.round(Math.random() * 100) };
+}
+function openQuiz() {
+  if (!quiz.q) quizNext();
+  const have = recs.filter(r => r.status === 'have');
+  const decs = countBy(have, decOf).sort((a, b) => a[0].localeCompare(b[0]));
+  const genres = countBy(have, r => r.genre).slice(0, 15);
+  const q = quiz.q, done = quiz.picked != null;
+  const img = q && (q.r.cover || q.r.thumb);
+  $('#statsBody').innerHTML = `<div id="quizView">
+    <div class="row"><button id="quizBack">‹ Statistik</button><h2 style="flex:1;text-align:center">Skivquiz</h2><button id="closeStats">Stäng</button></div>
+    <div class="np-s" style="margin-top:10px">${Object.keys(QUIZ_WHAT).map(k => `<button data-qwhat="${k}" class="${quiz.what === k ? 'on' : ''}">${{ artist: 'Artist', title: 'Skiva', year: 'År' }[k]}</button>`).join('')}
+      <button data-qhard="1" class="${quiz.hard ? 'on' : ''}">🔍 Svår</button></div>
+    <div class="row" style="gap:8px;margin-top:8px">
+      <select id="quizDec" style="flex:1"><option value="">Alla decennier</option>${decs.map(([d, n]) => `<option value="${esc(d)}" ${quiz.dec === d ? 'selected' : ''}>${esc(d)} (${n})</option>`).join('')}</select>
+      <select id="quizGenre" style="flex:1"><option value="">Alla genrer</option>${genres.map(([g, n]) => `<option value="${esc(g)}" ${quiz.genre === g ? 'selected' : ''}>${esc(g)} (${n})</option>`).join('')}</select>
+    </div>
+    ${quiz.total ? `<p class="note" style="text-align:center">Poäng: <b>${quiz.right} av ${quiz.total}</b></p>` : ''}
+    ${!q ? '<p class="msg">För få skivor med omslag (och olika svar) med de här valen. Välj ett annat decennium eller en annan genre.</p>' : `
+      <div class="quiz-img${quiz.hard && !done ? ' hard' : ''}"><img src="${esc(img)}" alt="Omslag" style="${quiz.hard && !done ? `transform-origin:${q.ox}% ${q.oy}%` : ''}"></div>
+      <h3 style="text-align:center">${QUIZ_WHAT[quiz.what]}</h3>
+      <div class="quiz-opts">${q.opts.map((o, i) => `<button data-qopt="${i}" class="${done ? (o === q.right ? 'right' : i === quiz.picked ? 'wrong' : '') : ''}" ${done ? 'disabled' : ''}>${esc(o)}</button>`).join('')}</div>
+      ${done ? `<p style="text-align:center;margin:12px 0 4px">${q.opts[quiz.picked] === q.right ? '🎉 Rätt!' : '❌ Fel.'} <b>${esc(q.r.title)}</b> – ${esc(q.r.artist)}${q.r.year ? ' (' + esc(q.r.year) + ')' : ''}</p>
+        <div class="actions"><button class="play" id="quizNext">Nästa skiva ›</button>
+          <button id="quizSpin">💿 Lägg på den nu</button></div>` : ''}`}
+  </div>`;
+  $('#statsSheet').classList.add('open');
+}
+function quizClick(e) {
+  if (!$('#quizView')) return false;
+  const b = e.target.closest('[data-qwhat],[data-qhard],[data-qopt],#quizBack,#quizNext,#quizSpin');
+  if (!b) return false;
+  if (b.id === 'quizBack') { openStats(); return true; }
+  if (b.id === 'quizSpin') { const r = quiz.q?.r; if (r) { closeStats(); openNowPlaying(r); } return true; }
+  if (b.id === 'quizNext') { quizNext(); openQuiz(); $('#statsSheet .panel').scrollTop = 0; return true; }
+  if (b.dataset.qwhat) { quiz.what = b.dataset.qwhat; quizNext(); openQuiz(); return true; }
+  if (b.dataset.qhard) { quiz.hard = !quiz.hard; openQuiz(); return true; }
+  if (b.dataset.qopt != null && quiz.q && quiz.picked == null) {
+    quiz.picked = +b.dataset.qopt; quiz.total++;
+    if (quiz.q.opts[quiz.picked] === quiz.q.right) quiz.right++;
+    openQuiz();
+  }
+  return true;
+}
+$('#statsSheet').addEventListener('change', e => {
+  if (e.target.id === 'quizDec') quiz.dec = e.target.value;
+  else if (e.target.id === 'quizGenre') quiz.genre = e.target.value;
+  else return;
+  quizNext(); setTimeout(openQuiz);
 });
 
 /* ---------------- Städa samlingen ----------------
@@ -3608,6 +3922,8 @@ function openStats(focus) {
     <div class="actions" style="margin-top:8px">
       <button id="stTidy">Städa samlingen${(() => { const n = recs.filter(r => TIDY.some(t => tidyMissing(r, t))).length; return n ? ` (${n} att se över)` : ''; })()}</button>
       <button id="stDivide">Avdelare för hyllan</button>
+      <div class="split"><button id="stInv">📋 Inventering${inv ? ` (${have.filter(r => inv.seen[r.id]).length}/${have.length})` : ''}</button>
+        <button id="stQuiz">🎯 Skivquiz</button></div>
       ${want.length ? '<button id="stShare">Dela önskelistan</button>' : ''}</div>
     <div class="kpi" style="margin-top:8px"><span>Samlingens värde (${esc(condShort(cfg.cond || 'Very Good Plus (VG+)'))})</span><b>${total}</b>
       <span>${valued.length} av ${have.length} värderade</span>
@@ -3771,8 +4087,10 @@ window.__back = () => {
   }
   if (compacted || recs.some(r => r.spTracks)) persistRecs();
   render();
+  npResume();   // "Nu spelas" var öppen när sidan laddades om
   resolveArtists();
   checkPending();
+  setTimeout(bkWarn, 4000);   // automatisk backup som inte fungerar
   resumeCov().then(cleanGemPhotos);
 })();
 </script>

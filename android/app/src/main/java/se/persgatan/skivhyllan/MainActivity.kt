@@ -535,7 +535,10 @@ class MainActivity : Activity() {
                     val uri = Uri.parse(saved)
                     try { writeTo(uri, json); reply(id, true, rememberName(uri)) }
                     catch (e: Exception) {
-                        if (mode == "auto") reply(id, false, "nouri") else runOnUiThread { pickSave(json, id) }
+                        // "fail:" (inte "nouri") så att webbappen kan varna: filen finns men gick inte att skriva till
+                        // (raderad eller flyttad på Drive, behörigheten borta efter ominstallation …).
+                        if (mode == "auto") reply(id, false, "fail:" + (e.message ?: e.javaClass.simpleName))
+                        else runOnUiThread { pickSave(json, id) }
                     }
                 }
             } else if (mode == "auto") reply(id, false, "nouri")
